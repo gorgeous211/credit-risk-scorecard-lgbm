@@ -77,10 +77,26 @@
 # 例如，同样有 5 笔贷款，一个客户负债稳定且按时还款，另一个客户近一个月突然新增 4 笔贷款，两者的风险可能完全不同。
 
 # %%
+# =============================================================================
+# 探索性数据分析（EDA）：只基于开发训练集 Train Dev
+# =============================================================================
+# 数据隔离原则（详见 00_stratified_split.py）：
+# 1. 训练数据只读取 data/interim/application_train_dev.csv，即 00 脚本按
+#    8:2 分层抽样得到的开发训练集；全量原始训练表 application_train.csv
+#    和闭卷验证集 application_valid_blind.csv 均不参与 EDA，避免验证集信息
+#    渗入缺失率统计、分箱拟合、IV 计算、相关性筛选等任何规则拟合环节。
+# 2. 官方未标注测试集 application_test.csv 没有 TARGET 标签，仅作为跨客群
+#    分布参照，用于计算开发集与官方测试集之间的 PSI 稳定性指标，
+#    不参与任何有监督拟合。
+# 3. 样本量、主键唯一性、开发集/验证集无重叠、坏账率一致性等切分校验
+#    已由 00_stratified_split.py 完成并落盘到
+#    outputs/validation/split_audit.csv，本脚本不再重复。
+# =============================================================================
+
 # 库
+import gc
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import toad
 
@@ -88,92 +104,71 @@ from optbinning import BinningProcess
 
 # 文件路径
 DATA_PATH = Path.cwd() / "data"
+RAW_DATA_PATH = DATA_PATH / "raw"
+INTERIM_DATA_PATH = DATA_PATH / "interim"
 OUTPUTS_PATH = Path.cwd() / "outputs"
 EDA_OUTPUT_PATH = OUTPUTS_PATH / "eda"
 EDA_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
-# 主申请表
-application_train = pd.read_csv(DATA_PATH / 'raw' / 'application_train.csv')
-application_test = pd.read_csv(DATA_PATH / 'raw' / 'application_test.csv')
+# 主申请表：开发训练集（00_stratified_split.py 的输出）与官方未标注测试集
+train_dev = pd.read_csv(INTERIM_DATA_PATH / 'application_train_dev.csv')
+application_test = pd.read_csv(RAW_DATA_PATH / 'application_test.csv')
 
-# cols_meaning = pd.read_csv(
-#     DATA_PATH / 'raw' / 'HomeCredit_columns_description.csv',
-#     usecols=['Table', 'Row', 'Description'],
-#     encoding='latin1'
-# )
-# cols_meaning = cols_meaning.loc[
-#     cols_meaning['Table'] == 'application_{train|test}.csv'
-# ].reset_index(drop=True)
-
-cols_eda = pd.read_csv(EDA_OUTPUT_PATH / 'cols_eda.csv')
+cols_meaning = pd.read_csv(
+    RAW_DATA_PATH / 'HomeCredit_columns_description.csv',
+    usecols=['Table', 'Row', 'Description'],
+    encoding='latin1'
+)
+cols_meaning = cols_meaning.loc[
+    cols_meaning['Table'] == 'application_{train|test}.csv'
+].reset_index(drop=True)
 
 # %%
-"一、样本整体盘点与客群对齐（Sample & Population Check）"
+"一、开发样本规模与测试集字段对齐（Sample & Schema Check）"
+# 样本量、主键唯一性、开发集/验证集无重叠、坏账率一致性等切分校验
+# 已由 00_stratified_split.py 完成，审计结果见
+# outputs/validation/split_audit.csv；本脚本不再重复校验。
 
 # -- 数据规模 --
-application_train.shape
-# (307511, 122)
-# application_train 样本量为307511，含有122个字段
+train_dev.shape
+# (246008, 122)
+# 开发训练集为原始训练表按 TARGET 分层抽取的 80%，共 246008 条、122 个字段
 
 application_test.shape
 # (48744, 121)
 # application_test 样本量为48744，含有121个字段
 
-# 检查测试集字段是否恰好等于训练集业务特征字段
-set(application_test.columns) == (set(application_train.columns) - {'TARGET'})
+# 检查测试集字段是否恰好等于开发集业务特征字段
+set(application_test.columns) == (set(train_dev.columns) - {'TARGET'})
 # True
-# 字段一致
+# 字段一致，仅相差标签列 TARGET
 
-# -- 重复与唯一性 --
-application_train.duplicated().any()
-# False
-application_train.duplicated(subset='SK_ID_CURR').any()
-# False
+# -- 官方测试集重复性 --
+# 开发集的重复样本与主键校验随全量主键唯一性检查一并完成，此处不再重复
 application_test.duplicated().any()
 # False
-" -> 无重复样本、无重复主键"
+" -> 官方测试集无重复样本"
 
 # %%
-"二、目标变量探索与好坏定义（Target EDA）"
-
-# 当前数据已给定 TARGET：1=违约，0=正常
-application_train['TARGET'].isna().sum()
-# 0
-set(application_train['TARGET'].dropna().unique()).issubset({0, 1})
-# True
-
-# 好坏样本数量
-application_train['TARGET'].value_counts(dropna=False)
-# TARGET
-# 0    282686
-# 1     24825
-# Name: count, dtype: int64
-
-# 整体坏账率
-f"{application_train['TARGET'].mean():.2%}"
-# 8.07%
-# -> 样本存在类别不平衡
-
-# %%
-"三、数据质量与单变量清洗（Univariate & Data Quality）"
+"二、数据质量与单变量清洗（Univariate & Data Quality）"
 
 # -- 数据类型与字段说明 --
-cols_train_types = application_train.dtypes.rename('dtypes')
+cols_dev_types = train_dev.dtypes.rename('dtypes')
 cols_test_types = application_test.dtypes.rename('dtypes')
 
-# cols_eda = cols_meaning.copy()
-cols_eda['dtypes'] = cols_eda['Row'].map(cols_train_types)
+cols_eda = cols_meaning.copy()
+cols_eda['dtypes'] = cols_eda['Row'].map(cols_dev_types)
 
-# 检查训练集与测试集业务特征字段类型是否一致
-cols_train_types.drop('TARGET').equals(cols_test_types)
+# 检查开发集与测试集业务特征字段类型是否一致
+cols_dev_types.drop('TARGET').equals(cols_test_types)
 # True
 
 # 主键不作为业务特征，标签也不进入单变量特征质量筛查
 feature_columns = [
-    column for column in application_train.columns
+    column for column in train_dev.columns
     if column not in {'SK_ID_CURR', 'TARGET'}
 ]
-numeric_feature_columns = application_train[feature_columns].select_dtypes(
+numeric_feature_columns = train_dev[feature_columns].select_dtypes(
     include='number'
 ).columns.tolist()
 
@@ -181,20 +176,20 @@ numeric_feature_columns = application_train[feature_columns].select_dtypes(
 # 阈值只用于待审查清单：缺失率 >90%、最大同值率 >95% 优先复核；不能脱离业务含义直接删特征。
 univariate_summary = pd.DataFrame(index=feature_columns)
 univariate_summary.index.name = 'Row'
-univariate_summary['missing_rate'] = application_train[feature_columns].isna().mean()
+univariate_summary['missing_rate'] = train_dev[feature_columns].isna().mean()
 univariate_summary['primary_value_ratio'] = pd.Series({
-    column: application_train[column].value_counts(dropna=False).iloc[0] / len(application_train)
+    column: train_dev[column].value_counts(dropna=False).iloc[0] / len(train_dev)
     for column in feature_columns
 })
 
-numeric_moments = application_train[numeric_feature_columns].agg(
+numeric_moments = train_dev[numeric_feature_columns].agg(
     ['count', 'mean', 'std']
 ).T
 univariate_summary = univariate_summary.join(numeric_moments)
 
 # -- 异常值识别 --
 # 计算数值字段的0.01、0.05、0.5、0.95和0.99分位数
-numeric_quantiles = application_train[numeric_feature_columns].quantile(
+numeric_quantiles = train_dev[numeric_feature_columns].quantile(
     [0.01, 0.05, 0.50, 0.95, 0.99]
 ).T
 numeric_quantiles.columns = ['p1', 'p5', 'p50', 'p95', 'p99']
@@ -206,10 +201,15 @@ cols_eda = cols_eda.merge(
     how='left'
 )
 
+# 清理字段类型说明与单变量质量汇总中间变量
+del cols_meaning, cols_dev_types, cols_test_types
+del feature_columns, numeric_feature_columns, numeric_moments, numeric_quantiles, univariate_summary
+gc.collect()
+
 # 在 DAYS_EMPLOYED 中发现 365243 特殊编码
 
 # -- 缺失率分析 --
-missing_summary = application_train.isna().mean().reset_index()
+missing_summary = train_dev.isna().mean().reset_index()
 missing_summary.columns = ['Row', 'missing_rate']
 
 # 没有缺失的列
@@ -223,54 +223,54 @@ missing_summary_nonzero = missing_summary[
 missing_columns = missing_summary_nonzero['Row'].tolist()
 
 missing_summary_nonzero.sort_values(by='missing_rate', ascending=False).head(20)
-#                        index  missing_rate
-# 41           COMMONAREA_MEDI      0.698723
-# 13            COMMONAREA_AVG      0.698723
-# 27           COMMONAREA_MODE      0.698723
-# 49  NONLIVINGAPARTMENTS_MEDI      0.694330
-# 35  NONLIVINGAPARTMENTS_MODE      0.694330
-# 21   NONLIVINGAPARTMENTS_AVG      0.694330
-# 51        FONDKAPREMONT_MODE      0.683862
-# 33     LIVINGAPARTMENTS_MODE      0.683550
-# 47     LIVINGAPARTMENTS_MEDI      0.683550
-# 19      LIVINGAPARTMENTS_AVG      0.683550
-# 31            FLOORSMIN_MODE      0.678486
-# 45            FLOORSMIN_MEDI      0.678486
-# 17             FLOORSMIN_AVG      0.678486
-# 26          YEARS_BUILD_MODE      0.664978
-# 40          YEARS_BUILD_MEDI      0.664978
-# 12           YEARS_BUILD_AVG      0.664978
-# 3                OWN_CAR_AGE      0.659908
-# 18              LANDAREA_AVG      0.593767
-# 46             LANDAREA_MEDI      0.593767
-# 32             LANDAREA_MODE      0.593767
+#                          Row  missing_rate
+# 27           COMMONAREA_MODE      0.698473
+# 13            COMMONAREA_AVG      0.698473
+# 41           COMMONAREA_MEDI      0.698473
+# 49  NONLIVINGAPARTMENTS_MEDI      0.694278
+# 35  NONLIVINGAPARTMENTS_MODE      0.694278
+# 21   NONLIVINGAPARTMENTS_AVG      0.694278
+# 51        FONDKAPREMONT_MODE      0.683681
+# 47     LIVINGAPARTMENTS_MEDI      0.683518
+# 19      LIVINGAPARTMENTS_AVG      0.683518
+# 33     LIVINGAPARTMENTS_MODE      0.683518
+# 31            FLOORSMIN_MODE      0.678315
+# 17             FLOORSMIN_AVG      0.678315
+# 45            FLOORSMIN_MEDI      0.678315
+# 40          YEARS_BUILD_MEDI      0.664791
+# 26          YEARS_BUILD_MODE      0.664791
+# 12           YEARS_BUILD_AVG      0.664791
+# 3                OWN_CAR_AGE      0.659853
+# 46             LANDAREA_MEDI      0.593595
+# 32             LANDAREA_MODE      0.593595
+# 18              LANDAREA_AVG      0.593595
 
-# 缺失率相同的字段组（由当前 application_train 统计，按缺失率降序）
+# 缺失率相同的字段组（由当前开发集统计，按缺失率降序）
 # 缺失率相同只表示缺失比例相同，缺失位置是否一致由下方逻辑继续核验
-# 69.8723%: COMMONAREA_AVG, COMMONAREA_MODE, COMMONAREA_MEDI
-# 69.4330%: NONLIVINGAPARTMENTS_AVG, NONLIVINGAPARTMENTS_MODE, NONLIVINGAPARTMENTS_MEDI
-# 68.3549%: LIVINGAPARTMENTS_AVG, LIVINGAPARTMENTS_MODE, LIVINGAPARTMENTS_MEDI
-# 67.8486%: FLOORSMIN_AVG, FLOORSMIN_MODE, FLOORSMIN_MEDI
-# 66.4978%: YEARS_BUILD_AVG, YEARS_BUILD_MODE, YEARS_BUILD_MEDI
-# 59.3767%: LANDAREA_AVG, LANDAREA_MODE, LANDAREA_MEDI
-# 58.5160%: BASEMENTAREA_AVG, BASEMENTAREA_MODE, BASEMENTAREA_MEDI
-# 55.1792%: NONLIVINGAREA_AVG, NONLIVINGAREA_MODE, NONLIVINGAREA_MEDI
-# 53.2960%: ELEVATORS_AVG, ELEVATORS_MODE, ELEVATORS_MEDI
-# 50.7497%: APARTMENTS_AVG, APARTMENTS_MODE, APARTMENTS_MEDI
-# 50.3488%: ENTRANCES_AVG, ENTRANCES_MODE, ENTRANCES_MEDI
-# 50.1933%: LIVINGAREA_AVG, LIVINGAREA_MODE, LIVINGAREA_MEDI
-# 49.7608%: FLOORSMAX_AVG, FLOORSMAX_MODE, FLOORSMAX_MEDI
-# 48.7810%: YEARS_BEGINEXPLUATATION_AVG, YEARS_BEGINEXPLUATATION_MODE, YEARS_BEGINEXPLUATATION_MEDI
-# 13.5016%: AMT_REQ_CREDIT_BUREAU_HOUR, AMT_REQ_CREDIT_BUREAU_DAY, AMT_REQ_CREDIT_BUREAU_WEEK,
+# 69.8473%: COMMONAREA_AVG, COMMONAREA_MODE, COMMONAREA_MEDI
+# 69.4278%: NONLIVINGAPARTMENTS_AVG, NONLIVINGAPARTMENTS_MODE, NONLIVINGAPARTMENTS_MEDI
+# 68.3518%: LIVINGAPARTMENTS_AVG, LIVINGAPARTMENTS_MODE, LIVINGAPARTMENTS_MEDI
+# 67.8315%: FLOORSMIN_AVG, FLOORSMIN_MODE, FLOORSMIN_MEDI
+# 66.4791%: YEARS_BUILD_AVG, YEARS_BUILD_MODE, YEARS_BUILD_MEDI
+# 59.3595%: LANDAREA_AVG, LANDAREA_MODE, LANDAREA_MEDI
+# 58.4859%: BASEMENTAREA_AVG, BASEMENTAREA_MODE, BASEMENTAREA_MEDI
+# 55.1271%: NONLIVINGAREA_AVG, NONLIVINGAREA_MODE, NONLIVINGAREA_MEDI
+# 53.2507%: ELEVATORS_AVG, ELEVATORS_MODE, ELEVATORS_MEDI
+# 50.7154%: APARTMENTS_AVG, APARTMENTS_MODE, APARTMENTS_MEDI
+# 50.2988%: ENTRANCES_AVG, ENTRANCES_MODE, ENTRANCES_MEDI
+# 50.1431%: LIVINGAREA_AVG, LIVINGAREA_MODE, LIVINGAREA_MEDI
+# 49.7240%: FLOORSMAX_AVG, FLOORSMAX_MODE, FLOORSMAX_MEDI
+# 48.7525%: YEARS_BEGINEXPLUATATION_AVG, YEARS_BEGINEXPLUATATION_MODE, YEARS_BEGINEXPLUATATION_MEDI
+# 13.5731%: AMT_REQ_CREDIT_BUREAU_HOUR, AMT_REQ_CREDIT_BUREAU_DAY, AMT_REQ_CREDIT_BUREAU_WEEK,
 #           AMT_REQ_CREDIT_BUREAU_MON, AMT_REQ_CREDIT_BUREAU_QRT, AMT_REQ_CREDIT_BUREAU_YEAR
-# 0.3320%: OBS_30_CNT_SOCIAL_CIRCLE, DEF_30_CNT_SOCIAL_CIRCLE,
+# 0.3301%: OBS_30_CNT_SOCIAL_CIRCLE, DEF_30_CNT_SOCIAL_CIRCLE,
 #          OBS_60_CNT_SOCIAL_CIRCLE, DEF_60_CNT_SOCIAL_CIRCLE
 
 # 进一步探究缺失模式
 for rate, group in missing_summary_nonzero.groupby('missing_rate'):
     if len(group) > 1:
         temp_list = group['Row'].tolist()
-        temp_df = application_train[temp_list]
+        temp_df = train_dev[temp_list]
         
         if len(temp_df.isna().T.drop_duplicates()) != 1:
             print(f"{temp_list}的缺失模式不同")
@@ -309,18 +309,23 @@ missing_summary_nonzero = missing_summary_nonzero.merge(
 
 cols_eda.to_csv(EDA_OUTPUT_PATH / 'cols_eda.csv', index=False)
 
+# 清理缺失率统计与模式核验中间变量
+del missing_summary, present_columns, missing_summary_nonzero, missing_columns
+del rate, group, temp_list, temp_df
+gc.collect()
+
 # %%
-"四、双变量分析与风险单调性检验（Bivariate & Risk Discrimination）"
+"三、双变量分析与风险单调性检验（Bivariate & Risk Discrimination）"
 # 先对 TARGET 以外的全部业务特征做统一初筛，再按 IV 降序查看，最后才附加业务类别
 # 使用 optbinning 对数值和类别变量批量最优分箱，缺失与常见特殊编码单独处理
 # 这是开发样本上的初筛 IV
 
 # %%
-"4.1 全量业务特征 IV 初筛与降序排名"
+"3.1 全量业务特征 IV 初筛与降序排名"
 # 1. 区分特征列表与类别型变量
 ignore_cols = ['SK_ID_CURR', 'TARGET']
-feature_cols = [c for c in application_train.columns if c not in ignore_cols]
-cat_cols = application_train[feature_cols].select_dtypes(include=['object', 'category']).columns.tolist()
+feature_cols = [c for c in train_dev.columns if c not in ignore_cols]
+cat_cols = train_dev[feature_cols].select_dtypes(include=['object', 'category']).columns.tolist()
 
 # 2. 配置特殊值编码（Home Credit 中 365243 代表退休/无业特殊编码，XNA 代表未知类别）
 # 也可传入字典针对不同特征指定不同特殊值，如：{'DAYS_EMPLOYED': [365243], 'CODE_GENDER': ['XNA']}
@@ -354,8 +359,8 @@ binning_process = BinningProcess(
 )
 
 binning_process.fit(
-    application_train[feature_cols],
-    application_train['TARGET']
+    train_dev[feature_cols],
+    train_dev['TARGET']
 )
 
 # summary() 提供各变量的 IV、分箱数及求解状态
@@ -368,93 +373,98 @@ cols_eda = cols_eda.join(iv_summary.set_index('feature'), on='Row')
 
 cols_eda.to_csv(EDA_OUTPUT_PATH / 'cols_eda.csv', index=False)
 
-# 清理本单元格的临时配置变量；保留 IV 结果及后续 PSI 所需对象。
-del ignore_cols, cat_cols, special_codes, eda_fit_params
+# 清理本单元格的临时配置变量与中间表；保留 IV 结果及后续 PSI 所需对象。
+del ignore_cols, cat_cols, special_codes, eda_fit_params, iv_summary
+gc.collect()
 
 # %%
-"4.2 IV 达标特征清单"
-high_iv_features = cols_eda.loc[cols_eda['iv'] >= 0.02, ['Row', 'iv']]
+"3.2 IV 达标特征清单"
+high_iv_features = cols_eda.loc[
+    cols_eda['iv'] >= 0.02, ['Row', 'iv']
+].sort_values(by='iv', ascending=False)
 # 按iv值大小降序排列
-# 	Row	iv
-# 43	EXT_SOURCE_3	0.33448379020482355
-# 42	EXT_SOURCE_2	0.31813665994270685
-# 41	EXT_SOURCE_1	0.14639290012546213
-# 18	DAYS_EMPLOYED	0.11399391282106762
-# 10	AMT_GOODS_PRICE	0.09203198201470272
-# 17	DAYS_BIRTH	0.08653932081929969
-# 28	OCCUPATION_TYPE	0.06104343197256081
-# 8	AMT_CREDIT	0.05931096593251868
-# 12	NAME_INCOME_TYPE	0.057896106859146104
-# 31	REGION_RATING_CLIENT_W_CITY	0.05120149755009072
-# 13	NAME_EDUCATION_TYPE	0.049224597800298246
-# 30	REGION_RATING_CLIENT	0.04831690185425046
-# 95	DAYS_LAST_PHONE_CHANGE	0.04774858490596422
-# 40	ORGANIZATION_TYPE	0.04282940064428906
-# 20	DAYS_ID_PUBLISH	0.04016654108956729
-# 3	CODE_GENDER	0.038597117741972505
-# 51	FLOORSMAX_AVG	0.038354500367963174
-# 79	FLOORSMAX_MEDI	0.03808228920708525
-# 65	FLOORSMAX_MODE	0.03761695808054861
-# 88	TOTALAREA_MODE	0.03726883394314958
-# 16	REGION_POPULATION_RELATIVE	0.03564908843629902
-# 55	LIVINGAREA_AVG	0.03433110147414867
-# 83	LIVINGAREA_MEDI	0.03414786950313495
-# 49	ELEVATORS_AVG	0.033216838210960886
-# 69	LIVINGAREA_MODE	0.03320633184971729
-# 23	FLAG_EMP_PHONE	0.032907128220936985
-# 77	ELEVATORS_MEDI	0.03289580029009964
-# 44	APARTMENTS_AVG	0.03262996981429838
-# 72	APARTMENTS_MEDI	0.032328573857287865
-# 38	REG_CITY_NOT_WORK_CITY	0.03220724394929676
-# 63	ELEVATORS_MODE	0.03200070270485087
-# 58	APARTMENTS_MODE	0.03176301782579833
-# 9	AMT_ANNUITY	0.030689010660250062
-# 74	YEARS_BEGINEXPLUATATION_MEDI	0.029325962819168466
-# 46	YEARS_BEGINEXPLUATATION_AVG	0.029115646330580957
-# 60	YEARS_BEGINEXPLUATATION_MODE	0.029102029395255802
-# 97	FLAG_DOCUMENT_3	0.028579108192551952
-# 19	DAYS_REGISTRATION	0.02848639824108758
-# 50	ENTRANCES_AVG	0.02770121067094218
-# 78	ENTRANCES_MEDI	0.027470830650918418
-# 64	ENTRANCES_MODE	0.026449632261004496
-# 89	WALLSMATERIAL_MODE	0.024996558933043922
-# 90	EMERGENCYSTATE_MODE	0.024043969836771
-# 57	NONLIVINGAREA_AVG	0.023089334798925144
-# 85	NONLIVINGAREA_MEDI	0.022855664592085406
-# 45	BASEMENTAREA_AVG	0.02263941554937595
-# 73	BASEMENTAREA_MEDI	0.022603006895192762
-# 71	NONLIVINGAREA_MODE	0.022591676410422937
-# 87	HOUSETYPE_MODE	0.022402813814709353
-# 37	REG_CITY_NOT_LIVE_CITY	0.022298689071670597
-# 21	OWN_CAR_AGE	0.02206093456689807
-# 59	BASEMENTAREA_MODE	0.02176626152408486
-# 14	NAME_FAMILY_STATUS	0.021697828732442588
+#                              Row      iv
+# 43                  EXT_SOURCE_3  0.3363
+# 42                  EXT_SOURCE_2  0.3225
+# 41                  EXT_SOURCE_1  0.1472
+# 18                 DAYS_EMPLOYED  0.1154
+# 10               AMT_GOODS_PRICE  0.0924
+# 17                    DAYS_BIRTH  0.0861
+# 28               OCCUPATION_TYPE  0.0600
+#  8                    AMT_CREDIT  0.0582
+# 12              NAME_INCOME_TYPE  0.0562
+# 13           NAME_EDUCATION_TYPE  0.0506
+# 31   REGION_RATING_CLIENT_W_CITY  0.0499
+# 95        DAYS_LAST_PHONE_CHANGE  0.0485
+# 30          REGION_RATING_CLIENT  0.0465
+# 40             ORGANIZATION_TYPE  0.0433
+# 20               DAYS_ID_PUBLISH  0.0426
+#  3                   CODE_GENDER  0.0396
+# 51                 FLOORSMAX_AVG  0.0371
+# 79                FLOORSMAX_MEDI  0.0370
+# 88                TOTALAREA_MODE  0.0364
+# 65                FLOORSMAX_MODE  0.0363
+# 16    REGION_POPULATION_RELATIVE  0.0346
+# 55                LIVINGAREA_AVG  0.0342
+# 83               LIVINGAREA_MEDI  0.0341
+# 23                FLAG_EMP_PHONE  0.0335
+# 69               LIVINGAREA_MODE  0.0329
+# 49                 ELEVATORS_AVG  0.0317
+# 77                ELEVATORS_MEDI  0.0314
+# 72               APARTMENTS_MEDI  0.0312
+# 44                APARTMENTS_AVG  0.0311
+#  9                   AMT_ANNUITY  0.0308
+# 38        REG_CITY_NOT_WORK_CITY  0.0307
+# 58               APARTMENTS_MODE  0.0306
+# 63                ELEVATORS_MODE  0.0305
+# 97               FLAG_DOCUMENT_3  0.0294
+# 60  YEARS_BEGINEXPLUATATION_MODE  0.0286
+# 19             DAYS_REGISTRATION  0.0285
+# 74  YEARS_BEGINEXPLUATATION_MEDI  0.0284
+# 46   YEARS_BEGINEXPLUATATION_AVG  0.0283
+# 50                 ENTRANCES_AVG  0.0269
+# 78                ENTRANCES_MEDI  0.0267
+# 64                ENTRANCES_MODE  0.0258
+# 89            WALLSMATERIAL_MODE  0.0242
+# 90           EMERGENCYSTATE_MODE  0.0232
+# 37        REG_CITY_NOT_LIVE_CITY  0.0231
+# 21                   OWN_CAR_AGE  0.0226
+# 14            NAME_FAMILY_STATUS  0.0221
+# 57             NONLIVINGAREA_AVG  0.0219
+# 87                HOUSETYPE_MODE  0.0218
+# 85            NONLIVINGAREA_MEDI  0.0217
+# 45              BASEMENTAREA_AVG  0.0215
+# 71            NONLIVINGAREA_MODE  0.0215
+# 73             BASEMENTAREA_MEDI  0.0215
+# 59             BASEMENTAREA_MODE  0.0207
 
-# 后续进一步做相关性分析
+# 清理 IV 达标特征清单临时变量
+del high_iv_features
+gc.collect()
 
 # %%
-"五、跨时间稳定性与数据穿越排查（Stability & Leakage Check）"
-# 由02的对抗验证结果，AUC=0.89 表明测试集与验证集有强烈的分布偏移
+"四、跨时间稳定性与数据穿越排查（Stability & Leakage Check）"
+# 由 02_adversarial_validation.py 的对抗验证结果，AUC=0.89 表明官方测试集与训练数据存在强烈的分布偏移
 #                        feature     importance
-# 6                   AMT_CREDIT  287596.707496
-# 7                  AMT_ANNUITY  200538.586412
-# 117  AMT_REQ_CREDIT_BUREAU_MON  183063.273897
-# 118  AMT_REQ_CREDIT_BUREAU_QRT  157605.925762
-# 8              AMT_GOODS_PRICE  114633.155271
-# 0           NAME_CONTRACT_TYPE   91235.675193
-# 38           ORGANIZATION_TYPE   57943.737944
-# 25                  FLAG_EMAIL   57537.064442
-# 39                EXT_SOURCE_1   52712.000303
-# 93      DAYS_LAST_PHONE_CHANGE   42720.664838
+# 6                   AMT_CREDIT  126529.919421
+# 7                  AMT_ANNUITY   90629.472365
+# 118  AMT_REQ_CREDIT_BUREAU_QRT   85252.653770
+# 117  AMT_REQ_CREDIT_BUREAU_MON   70770.088168
+# 8              AMT_GOODS_PRICE   54966.208739
+# 0           NAME_CONTRACT_TYPE   36930.647128
+# 25                  FLAG_EMAIL   32490.213146
+# 39                EXT_SOURCE_1   24006.952228
+# 38           ORGANIZATION_TYPE   23038.961704
+# 93      DAYS_LAST_PHONE_CHANGE   20621.832702
 
-# 补充单变量的PSI：用训练集拟合出的同一套分箱转换训练集和测试集
+# 补充单变量的PSI：用开发集拟合出的同一套分箱转换开发集和官方测试集
 train_bins = pd.DataFrame(
     binning_process.transform(
-        application_train[feature_cols],
+        train_dev[feature_cols],
         metric="bins"
     ),
     columns=feature_cols,
-    index=application_train.index
+    index=train_dev.index
 )
 test_bins = pd.DataFrame(
     binning_process.transform(
@@ -472,242 +482,16 @@ psi_summary = toad.metrics.PSI(
     train_bins[feature_cols]
 ).sort_values(ascending=False)
 
-# 筛选psi
-# 0.10 <= PSI <= 0.25：轻微偏移，有条件保留；结合业务原因排查，必要时合并分箱或加强监控。
-# PSI > 0.25：显著偏移（不稳定），原则上删除；若为核心强特征，先进行特征改造，再重新评估。
-psi_summary[psi_summary > 0.1]
-
-# AMT_REQ_CREDIT_BUREAU_MON    0.429540
-# AMT_REQ_CREDIT_BUREAU_QRT    0.310101
-# NAME_CONTRACT_TYPE           0.211138
-# FLAG_EMAIL                   0.124205
-
 # 添加结果到cols_eda
 cols_eda['psi'] = cols_eda['Row'].map(psi_summary)
 
 cols_eda.to_csv(EDA_OUTPUT_PATH / 'cols_eda.csv', index=False)
 
-# 清理 PSI 计算使用的临时分箱数据；保留 psi_summary 和 cols_eda 结果。
-del train_bins, test_bins
+# 清理 PSI 计算使用的临时分箱数据、已完成使命的分箱器、官方测试集与 PSI 汇总序列，释放内存
+del train_bins, test_bins, binning_process, application_test, psi_summary
+gc.collect()
 
-# %%
-# 执行漏斗初筛后进行相关性分析
+# 清理开发集大表及所有剩余变量，释放内存（初筛与共线性分析已移至 03_feature_engineering.py）
+del train_dev, cols_eda, feature_cols
+gc.collect()
 
-# 1.数据质量维度（基础过滤）
-# -- 缺失率 --
-# 逻辑回归评分卡通常剔除缺失率大于 70% 至 80% 的特征；
-# XGBoost 或 LightGBM 等树模型因天然支持缺失值分裂，阈值常放宽至 90% 至 95%
-# 若“是否缺失”本身代表某种客群特征（例如未查得征信记录），即使高缺失也应先计算 IV 值再决定去留
-
-# -- 同值率 --
-# 当某个特征的单一取值（不含缺失值）占比超过 90% 至 95% 时，说明该变量缺乏方差，区分度极低，通常直接剔除
-
-# -- 方差 --
-# 连续型变量若方差接近 0，直接过滤
-
-# 2.预测区分能力（核心过滤）
-# -- IV 信息值评估标准 --
-# IV < 0.02，几乎无预测能力，粗筛直接剔除
-# 0.02 <= IV < 0.1，弱预测能力，视特征池丰富程度决定是否保留
-# 0.1 <= IV < 0.3，中等预测能力，优先保留
-# 0.3 <= IV < 0.5，强预测能力，核心入模候选特征
-# IV >= 0.5，区分度过高，需重点排查是否存在数据穿越
-
-# 对于低 IV 特征，优先做业务交叉衍生，完成上述交叉衍生后，原特征本身的任务就完成了
-# 进入评分卡的特征初筛环节时，直接从候选特征池中剔除，不对其进行 WOE 转换，也不送入后续的多变量分析
-
-# -- PSI 群体稳定性评估标准 --
-# PSI < 0.10：非常稳定，特征分布无明显变化，可直接保留。
-# 0.10 <= PSI < 0.25：轻微偏移，有条件保留；结合业务原因排查，必要时合并分箱或加强监控。
-# PSI >= 0.25：显著偏移（不稳定），原则上删除；若为核心强特征，先进行特征改造，再重新评估。
-
-# -- Pearson / Spearman相关系数 --
-# 当两个特征的相关系数绝对值大于 0.70 或 0.80 时，视为高度共线
-# 通常采取“优胜劣汰”原则：对比两者的 IV 值和 PSI，保留 IV 更高或 PSI 更低的那个，剔除另一个
-
-# 第一层：剔除极高同值特征，同值率大于0.95
-ignore_cols = ['SK_ID_CURR', 'TARGET']
-feature_cols = [c for c in application_train.columns if c not in ignore_cols]
-
-high_primary_value_ratio = cols_eda.loc[cols_eda['primary_value_ratio'] > 0.95, ['Row', 'primary_value_ratio']]
-
-# 第二层：剔除跨期不稳定特征，PSI 大于0.25
-high_psi = cols_eda.loc[cols_eda['psi'] >= 0.25, ['Row', 'psi']]
-
-# 第三层：剔除无区分度特征，IV 低于0.02
-low_iv = cols_eda.loc[cols_eda['iv'] < 0.02, ['Row', 'iv']]
-
-# 一共剔除的特征
-first_delete_features = set(high_primary_value_ratio['Row'].tolist() + high_psi['Row'].tolist() + low_iv['Row'].tolist())
-
-model_features = [col for col in feature_cols
-                  if col not in first_delete_features]
-
-model_features_summary = cols_eda[cols_eda['Row'].isin(model_features)].reset_index(drop=True)
-
-# 清理漏斗筛选的中间表；保留最终剔除清单和后续分析所需结果。
-del high_primary_value_ratio, high_psi, low_iv
-
-# %%
-"六、多变量共线性与相关性分析（Multivariate Analysis）"
-# 在model_features_summary中有53个特征，其中有大量的房屋特征，进行去重
-
-# 第一步进行EDA 粗筛，使用原始特征值
-house_cols = model_features_summary.loc[
-    model_features_summary['Description'].str.startswith('Normalized information'), 'Row'
-    ].tolist()
-# 一共28个房屋特征
-
-# 筛选数值类型的房屋特征
-house_num_features = model_features_summary[
-    model_features_summary['Description'].str.startswith('Normalized information') &
-    (model_features_summary['dtypes'] == 'float64')
-    ]
-house_num_cols = house_num_features['Row'].sort_values().tolist()
-# 一共25个数值房屋特征
-
-# 计算Pearson相关性矩阵
-house_corr = application_train[house_num_cols].corr()
-
-# 结合贪心共线性剔除法（Greedy Collinearity Elimination，即按 IV 从高到低排序，依次剔除与高 IV 特征相关系数超标的低 IV 特征）
-# 第一步剔除同源后缀冗余
-
-prefix = house_corr.index.to_series().str.split('_').str[0]
-prefix = prefix.drop_duplicates().reset_index(drop=True)
-for i in prefix:
-    rows = house_corr.index.str.startswith(i)
-    cols = house_corr.columns.str.startswith(i)
-    print(house_corr.loc[rows, cols])
-
-del i, rows, cols, prefix
-#                  APARTMENTS_AVG  APARTMENTS_MEDI  APARTMENTS_MODE
-# APARTMENTS_AVG         1.000000         0.995081         0.973259
-# APARTMENTS_MEDI        0.995081         1.000000         0.977193
-# APARTMENTS_MODE        0.973259         0.977193         1.000000
-#                    BASEMENTAREA_AVG  BASEMENTAREA_MEDI  BASEMENTAREA_MODE
-# BASEMENTAREA_AVG           1.000000           0.994317           0.973496
-# BASEMENTAREA_MEDI          0.994317           1.000000           0.977938
-# BASEMENTAREA_MODE          0.973496           0.977938           1.000000
-#                 ELEVATORS_AVG  ELEVATORS_MEDI  ELEVATORS_MODE
-# ELEVATORS_AVG        1.000000        0.996099        0.978837
-# ELEVATORS_MEDI       0.996099        1.000000        0.982828
-# ELEVATORS_MODE       0.978837        0.982828        1.000000
-#                 ENTRANCES_AVG  ENTRANCES_MEDI  ENTRANCES_MODE
-# ENTRANCES_AVG        1.000000        0.996886        0.977743
-# ENTRANCES_MEDI       0.996886        1.000000        0.980677
-# ENTRANCES_MODE       0.977743        0.980677        1.000000
-#                 FLOORSMAX_AVG  FLOORSMAX_MEDI  FLOORSMAX_MODE
-# FLOORSMAX_AVG        1.000000        0.997034        0.985689
-# FLOORSMAX_MEDI       0.997034        1.000000        0.988237
-# FLOORSMAX_MODE       0.985689        0.988237        1.000000
-#                  LIVINGAREA_AVG  LIVINGAREA_MEDI  LIVINGAREA_MODE
-# LIVINGAREA_AVG         1.000000         0.995596         0.972050
-# LIVINGAREA_MEDI        0.995596         1.000000         0.974743
-# LIVINGAREA_MODE        0.972050         0.974743         1.000000
-#                     NONLIVINGAREA_AVG  NONLIVINGAREA_MEDI  NONLIVINGAREA_MODE
-# NONLIVINGAREA_AVG            1.000000            0.990444            0.966087
-# NONLIVINGAREA_MEDI           0.990444            1.000000            0.975839
-# NONLIVINGAREA_MODE           0.966087            0.975839            1.000000
-#                 TOTALAREA_MODE
-# TOTALAREA_MODE             1.0
-#                               YEARS_BEGINEXPLUATATION_AVG  ...  YEARS_BEGINEXPLUATATION_MODE
-# YEARS_BEGINEXPLUATATION_AVG                      1.000000  ...                      0.971893
-# YEARS_BEGINEXPLUATATION_MEDI                     0.993825  ...                      0.963539
-# YEARS_BEGINEXPLUATATION_MODE                     0.971893  ...                      1.000000
-
-# 观察矩阵可以发现，同一物理属性下的 _AVG（均值）、_MEDI（中位数）和 _MODE（众数）相关系数全部在 0.9635 至 0.9970 之间，属于完全等价的信息重复。
-# 在每组中仅保留 IV 最高的一个代表特征，直接剔除其余 16 个后缀特征
-house_num_features['prefix'] = house_num_features['Row'].str.split('_').str[0]
-house_num_features = house_num_features.sort_values(by=['prefix', 'iv'], ascending=[True, False])
-house_num_keep_cols = house_num_features.groupby('prefix')['Row'].head(1).tolist()
-# 	Row
-# 23	APARTMENTS_AVG
-# 24	BASEMENTAREA_AVG
-# 26	ELEVATORS_AVG
-# 27	ENTRANCES_AVG
-# 28	FLOORSMAX_AVG
-# 29	LIVINGAREA_AVG
-# 30	NONLIVINGAREA_AVG
-# 48	TOTALAREA_MODE
-# 41	YEARS_BEGINEXPLUATATION_MEDI
-
-# 第二步，剔除跨维度规模共线性
-# 进一步对保留的特征做相关性分析
-house_corr = application_train[house_num_keep_cols].corr()
-mask = house_corr.columns.isin(['APARTMENTS_AVG', 'ELEVATORS_AVG', 'LIVINGAREA_AVG', 'TOTALAREA_MODE'])
-
-house_corr.loc[mask, mask]
-#                 APARTMENTS_AVG  ELEVATORS_AVG  LIVINGAREA_AVG  TOTALAREA_MODE
-# APARTMENTS_AVG        1.000000       0.836958        0.913619        0.892627
-# ELEVATORS_AVG         0.836958       1.000000        0.867776        0.844628
-# LIVINGAREA_AVG        0.913619       0.867776        1.000000        0.925039
-# TOTALAREA_MODE        0.892627       0.844628        0.925039        1.000000
-
-del house_corr, mask
-
-house_num_features.loc[house_num_features['Row'].isin(['APARTMENTS_AVG', 'ELEVATORS_AVG', 'LIVINGAREA_AVG', 'TOTALAREA_MODE']), 
-                   ['Row', 'iv']]
-#                Row        iv
-# 23  APARTMENTS_AVG  0.032630
-# 26   ELEVATORS_AVG  0.033217
-# 29  LIVINGAREA_AVG  0.034331
-# 48  TOTALAREA_MODE  0.037269
-
-# 这组特征间相关性很强，保留最大iv值的TOTALAREA_MODE
-house_num_keep_cols = [col for col in house_num_keep_cols if col not in ['APARTMENTS_AVG', 'ELEVATORS_AVG', 'LIVINGAREA_AVG']]
-
-house_num_delete_cols = [col for col in house_num_cols if col not in house_num_keep_cols]
-
-del house_num_features, house_num_keep_cols
-
-# 去除28个房屋特征后，对剩余数值类型特征进行相关性分析
-rest_model_num_features = model_features_summary.loc[
-    (~model_features_summary['Row'].isin(house_cols)) & (model_features_summary['dtypes'] != 'object'),
-    'Row'].tolist()
-
-del house_cols, house_num_cols
-rest_corr = application_train[rest_model_num_features].corr()
-# 筛选出相关系数大于0.8的强线性相关变量
-mask = np.triu(np.ones(rest_corr.shape), k=1).astype(bool)
-result = rest_corr.where(mask).stack().reset_index()
-result.columns = ['val1', 'val2', 'corr']
-
-result[np.abs(result['corr']) > 0.8]
-#                      val1                         val2      corr
-# 1              AMT_CREDIT              AMT_GOODS_PRICE  0.986968
-# 83          DAYS_EMPLOYED               FLAG_EMP_PHONE -0.999755
-# 135  REGION_RATING_CLIENT  REGION_RATING_CLIENT_W_CITY  0.950842
-
-del rest_corr, mask, result
-
-# 比较各自的iv值
-cols_eda.loc[cols_eda['Row'].isin(['AMT_CREDIT', 'AMT_GOODS_PRICE']), ['Row', 'iv']]
-#                 Row        iv
-# 8        AMT_CREDIT  0.059311
-# 10  AMT_GOODS_PRICE  0.092032
-
-# 保留AMT_GOODS_PRICE
-
-cols_eda.loc[cols_eda['Row'].isin(['DAYS_EMPLOYED', 'FLAG_EMP_PHONE']), ['Row', 'iv']]
-#                Row        iv
-# 18   DAYS_EMPLOYED  0.113994
-# 23  FLAG_EMP_PHONE  0.032907
-
-# 保留DAYS_EMPLOYED
-
-cols_eda.loc[cols_eda['Row'].isin(['REGION_RATING_CLIENT', 'REGION_RATING_CLIENT_W_CITY']), ['Row', 'iv']]
-#                             Row        iv
-# 30         REGION_RATING_CLIENT  0.048317
-# 31  REGION_RATING_CLIENT_W_CITY  0.051201
-
-# 保留REGION_RATING_CLIENT_W_CITY
-
-# 得到最终相关性筛选后的删除特征名单
-secend_delete_features = house_num_delete_cols + ['AMT_CREDIT', 'FLAG_EMP_PHONE', 'REGION_RATING_CLIENT']
-del rest_model_num_features, house_num_delete_cols
-
-# 最终入模变量
-model_features = [col for col in model_features if col not in secend_delete_features]
-model_features_summary = cols_eda[cols_eda['Row'].isin(model_features)]
-
-model_features_summary.to_csv(EDA_OUTPUT_PATH / 'model_features_summary.csv', index=False)

@@ -42,6 +42,7 @@ from sklearn.model_selection import train_test_split
 DATA_PATH = Path.cwd() / "data"
 RAW_DATA_PATH = DATA_PATH / "raw"
 INTERIM_DATA_PATH = DATA_PATH / "interim"
+INTERIM_DATA_PATH.mkdir(parents=True, exist_ok=True)
 
 OUTPUTS_PATH = Path.cwd() / "outputs"
 VALIDATION_OUTPUT_PATH = OUTPUTS_PATH / "validation"
