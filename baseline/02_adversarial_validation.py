@@ -11,7 +11,10 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 # 文件路径
-DATA_PATH = Path().cwd() / 'data'
+DATA_PATH = Path.cwd() / "data"
+OUTPUTS_PATH = Path.cwd() / "outputs"
+VALIDATION_OUTPUT_PATH = OUTPUTS_PATH / "validation"
+VALIDATION_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 # 主申请表
 application_train = pd.read_csv(DATA_PATH / 'raw' / 'application_train.csv').drop(
@@ -44,6 +47,12 @@ feature_importance = np.zeros(X.shape[1])
 # learning_rate、n_estimators根据经验确定，min_child_sample根据数据集确定
 # max_depth、num_leaves、subsample、colsample_bytree、reg_alpha、reg_lambda通过算法搜索参数
 
+# min_child_samples: 根据数据集样本量 N 确定，经验比例约为 N 的 0.01% ~ 0.1%：
+#   - 小样本 (N < 1万): 10 ~ 20 (默认20)
+#   - 中等样本 (1万 ~ 10万): 20 ~ 50
+#   - 较大样本 (10万 ~ 100万，如本项目约35万): 50 ~ 200 (此处取50)
+#   - 超大样本 (N > 100万): 200 ~ 2000+
+#   调大该参数可防止叶节点拟合局部噪声，对抗验证中尤其需要适度调大以捕捉宏观分布漂移
 # max_depth: 一般在3，4，5中取一个
 # num_leaves: LightGBM中与max_depth配合，要小于2^max_depth-1
 # subsample: 一般给出大致的搜索范围如[0.8, 0.9, 1.0]这样几个比较整的数值
@@ -132,3 +141,7 @@ importance_df.head(10)
 # 通过AUC的值可以得出，训练集和测试集二者存在可检测的特征分布差异
 # AMT_CREDIT、AMT_ANNUITY 等排名靠前，可作为进一步检查分布差异的重点变量
 # 该结果反映当前模型的区分能力；要判断具体漂移特征及其对违约预测的影响，还需比较这些变量的训练集与测试集分布
+
+# %%
+# 保存对抗验证特征重要性表至 outputs/validation
+importance_df.to_csv(VALIDATION_OUTPUT_PATH / 'adversarial_validation_feature_importance.csv', index=False)

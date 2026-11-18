@@ -27,13 +27,17 @@ from sklearn.metrics import roc_auc_score, roc_curve
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 # 文件路径
-DATA_PATH = Path().cwd() / 'data'
+DATA_PATH = Path.cwd() / "data"
+OUTPUTS_PATH = Path.cwd() / "outputs"
+EDA_OUTPUT_PATH = OUTPUTS_PATH / "eda"
+MODEL_OUTPUT_PATH = OUTPUTS_PATH / "models"
+MODEL_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 # 主申请表，一共36个特征
 train_fe = pd.read_csv(DATA_PATH / 'processed' / 'train_fe.csv')
 
 # eda结果
-cols_eda = pd.read_csv(DATA_PATH / 'interim' / 'cols_eda.csv')
+cols_eda = pd.read_csv(EDA_OUTPUT_PATH / 'cols_eda.csv')
 
 # train_fe 拆分为X和y
 X = train_fe.drop(columns='TARGET').copy()
@@ -303,9 +307,10 @@ del base_odds, lr_estimator
 # Scorecard.fit 接收的是未转 WOE 前的原始训练集（内部会自动调用 fine_binning_process）
 scorecard.fit(X_train[final_model_feats], y_train)
 
-# 导出标准评分卡各分箱加减分明细表
+# 导出标准评分卡各分箱加减分明细表至 outputs/models
 scorecard_table = scorecard.table(style="detailed")
-scorecard_table.to_csv(DATA_PATH / 'processed' / 'final_scorecard_table.csv', index=False)
+MODEL_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+scorecard_table.to_csv(MODEL_OUTPUT_PATH / 'final_scorecard_table.csv', index=False)
 
 # %%
 # 模型评估

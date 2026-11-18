@@ -9,6 +9,8 @@ __pycache__/
 *.tmp
 *.swp
 
-# 原始数据集
-/data/raw/
-/data/processed
+# 数据集文件（大文件不入版本库）
+/data/raw/*
+!/data/raw/HomeCredit_columns_description.csv
+/data/interim/
+/data/processed/

@@ -13,15 +13,17 @@ import toad
 from optbinning import BinningProcess
 
 # 文件路径
-DATA_PATH = Path().cwd() / 'data'
+DATA_PATH = Path.cwd() / "data"
+OUTPUTS_PATH = Path.cwd() / "outputs"
+EDA_OUTPUT_PATH = OUTPUTS_PATH / "eda"
 
 # 主申请表
 application_train = pd.read_csv(DATA_PATH / 'raw' / 'application_train.csv')
 application_test = pd.read_csv(DATA_PATH / 'raw' / 'application_test.csv')
 
 # eda结果
-cols_eda = pd.read_csv(DATA_PATH / 'interim' / 'cols_eda.csv')
-model_features_summary = pd.read_csv(DATA_PATH / 'interim' / 'model_features_summary.csv')
+cols_eda = pd.read_csv(EDA_OUTPUT_PATH / 'cols_eda.csv')
+model_features_summary = pd.read_csv(EDA_OUTPUT_PATH / 'model_features_summary.csv')
 
 # %%
 model_features_summary = model_features_summary[['Row', 'Description','iv', 'psi']]
@@ -227,4 +229,5 @@ del delete_cols
 
 # %%
 # 输出特征工程加工结果
+(DATA_PATH / 'processed').mkdir(parents=True, exist_ok=True)
 train_fe.to_csv(DATA_PATH / 'processed' / 'train_fe.csv', index=False)

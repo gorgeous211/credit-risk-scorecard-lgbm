@@ -12,11 +12,15 @@ from sklearn.metrics import roc_auc_score, roc_curve
 
 # 文件路径
 DATA_PATH = Path.cwd() / "data"
+OUTPUTS_PATH = Path.cwd() / "outputs"
+EDA_OUTPUT_PATH = OUTPUTS_PATH / "eda"
+MODEL_OUTPUT_PATH = OUTPUTS_PATH / "models"
+MODEL_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 # 主申请表
 application_train = pd.read_csv(DATA_PATH / 'raw' / 'application_train.csv')
 
-cols_eda = pd.read_csv(DATA_PATH / 'interim' / 'cols_eda.csv')
+cols_eda = pd.read_csv(EDA_OUTPUT_PATH / 'cols_eda.csv')
 
 # 提取房屋相关列（标准化信息）
 house_cols = cols_eda.loc[
@@ -282,9 +286,9 @@ print(importance_df.head(15)[['feature', 'gain_importance', 'cumulative_gain']])
 # 13        EXT_MEAN_TO_BIRTH         0.014596         0.733013
 # 14      EXT_SOURCE_WEIGHTED         0.014437         0.747450
 
-# 保存特征重要性表
-(DATA_PATH / 'interim').mkdir(parents=True, exist_ok=True)
-importance_df.to_csv(DATA_PATH / 'interim' / 'lgb_feature_importance.csv', index=False)
+# 保存特征重要性表至 outputs/models
+MODEL_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+importance_df.to_csv(MODEL_OUTPUT_PATH / 'lgb_feature_importance.csv', index=False)
 
 # 清理精筛过程的中间变量与大型数据副本
 del X, categorical_cols, candidate_feature_cols, gain_importance, importance_df

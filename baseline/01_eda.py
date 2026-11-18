@@ -88,13 +88,16 @@ from optbinning import BinningProcess
 
 # 文件路径
 DATA_PATH = Path.cwd() / "data"
+OUTPUTS_PATH = Path.cwd() / "outputs"
+EDA_OUTPUT_PATH = OUTPUTS_PATH / "eda"
+EDA_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 # 主申请表
 application_train = pd.read_csv(DATA_PATH / 'raw' / 'application_train.csv')
 application_test = pd.read_csv(DATA_PATH / 'raw' / 'application_test.csv')
 
 # cols_meaning = pd.read_csv(
-#     DATA_PATH / 'HomeCredit_columns_description.csv',
+#     DATA_PATH / 'raw' / 'HomeCredit_columns_description.csv',
 #     usecols=['Table', 'Row', 'Description'],
 #     encoding='latin1'
 # )
@@ -102,7 +105,7 @@ application_test = pd.read_csv(DATA_PATH / 'raw' / 'application_test.csv')
 #     cols_meaning['Table'] == 'application_{train|test}.csv'
 # ].reset_index(drop=True)
 
-cols_eda = pd.read_csv(DATA_PATH / 'interim' / 'cols_eda.csv')
+cols_eda = pd.read_csv(EDA_OUTPUT_PATH / 'cols_eda.csv')
 
 # %%
 "一、样本整体盘点与客群对齐（Sample & Population Check）"
@@ -304,7 +307,7 @@ missing_summary_nonzero = missing_summary_nonzero.merge(
 #     x='missing_rate',
 #     y='Row')
 
-cols_eda.to_csv(DATA_PATH / 'interim' / 'cols_eda.csv', index=False)
+cols_eda.to_csv(EDA_OUTPUT_PATH / 'cols_eda.csv', index=False)
 
 # %%
 "四、双变量分析与风险单调性检验（Bivariate & Risk Discrimination）"
@@ -363,7 +366,7 @@ iv_summary = iv_summary.sort_values(by='iv', ascending=False).reset_index(drop=T
 # 结果加入cols_eda
 cols_eda = cols_eda.join(iv_summary.set_index('feature'), on='Row')
 
-cols_eda.to_csv(DATA_PATH / 'interim' / 'cols_eda.csv', index=False)
+cols_eda.to_csv(EDA_OUTPUT_PATH / 'cols_eda.csv', index=False)
 
 # 清理本单元格的临时配置变量；保留 IV 结果及后续 PSI 所需对象。
 del ignore_cols, cat_cols, special_codes, eda_fit_params
@@ -482,7 +485,7 @@ psi_summary[psi_summary > 0.1]
 # 添加结果到cols_eda
 cols_eda['psi'] = cols_eda['Row'].map(psi_summary)
 
-cols_eda.to_csv(DATA_PATH / 'interim' / 'cols_eda.csv', index=False)
+cols_eda.to_csv(EDA_OUTPUT_PATH / 'cols_eda.csv', index=False)
 
 # 清理 PSI 计算使用的临时分箱数据；保留 psi_summary 和 cols_eda 结果。
 del train_bins, test_bins
@@ -707,4 +710,4 @@ del rest_model_num_features, house_num_delete_cols
 model_features = [col for col in model_features if col not in secend_delete_features]
 model_features_summary = cols_eda[cols_eda['Row'].isin(model_features)]
 
-model_features_summary.to_csv(DATA_PATH / 'interim' / 'model_features_summary.csv', index=False)
+model_features_summary.to_csv(EDA_OUTPUT_PATH / 'model_features_summary.csv', index=False)
