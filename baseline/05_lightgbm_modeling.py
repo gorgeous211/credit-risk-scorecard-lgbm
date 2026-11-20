@@ -14,6 +14,7 @@
 # 3. 官方未标注测试集（Official Test, 4.8 万条）：
 #    读取 data/raw/application_test.csv。无 TARGET 标签，直接输入训练好的模型输出预测分值，
 #    用于评估跨客群模型预测概率总分 PSI，检验模型面对未知分布时的稳定性。
+#    严禁在特征工程与筛选阶段利用测试集计算单特征 PSI 进行特征准入过滤（彻底杜绝数据泄露）。
 # =============================================================================
 
 # %%
@@ -192,48 +193,65 @@ for d_col in derived_cols:
 
 del d_col, val_counts
 
-# 2. 稳定性过滤：剔除分布漂移严重的特征，PSI > 0.25
-# 原始特征基于 EDA 结果（Train Dev vs Official Test）；衍生特征基于开发集与官方测试集计算
-high_psi = cols_eda.loc[cols_eda['psi'] > 0.25, 'Row'].tolist()
-
-combiner = toad.transform.Combiner()
-combiner.fit(train_dev[derived_cols], method='quantile', n_bins=10)
-derived_psi = toad.metrics.PSI(application_test[derived_cols], train_dev[derived_cols], combiner=combiner)
-
-# 剔除 psi > 0.25 的衍生特征
-high_psi_derived = derived_psi[derived_psi > 0.25].index.tolist()
-high_psi.extend(high_psi_derived)
-del combiner, high_psi_derived
+# =============================================================================
+# 2. 稳定性过滤（原 PSI > 0.25 特征初筛已彻底移除）
+# -----------------------------------------------------------------------------
+# 【数据泄露防范批注 / Data Leakage Prevention Note】:
+# 原代码在此处利用测试集 (application_test) 计算了原始特征与衍生特征的 PSI 指标，
+# 并基于 `high_psi` (PSI > 0.25) 进行了特征粗筛剔除。
+# 现已彻底去除在特征筛选阶段对 PSI 的筛选，原因如下：
+# 1. 严格禁止测试集数据泄露（Zero Data Leakage 原则）：
+#    测试集用于评估模型在未知分布上的真实泛化能力，建模与特征工程阶段应将其完全视作“不可见数据”。
+#    若在特征筛选时引入测试集计算单特征 PSI 并以此剔除漂移特征，属于无监督数据穿越（Unsupervised Data Leakage），
+#    使模型构建过程受到未来/盲测数据分布的先验污染。
+# 2. 避免对未知分布的过拟合与虚假高估稳定性：
+#    针对特定测试集人工剔除漂移特征，会导致入模特征强行适配该测试集，使最终测试集评估出的
+#    模型预测概率 PSI 和区分度（AUC/KS）呈现过于乐观的虚假繁荣，在实际生产部署面对真实客群漂移时
+#    将产生严重的泛化性能崩溃。
+# 3. PSI 的角色应严格限定于模型级事后评估与上线监控：
+#    PSI 是模型交付后的整体健康度监控指标，应在模型最终训练完成并冻结后，通过评估模型输出的
+#    违约概率/评分在测试集上的宏观分布变化来衡量模型稳定性，绝不应用于前置反向指导特征准入。
+#    因此，此处不再执行基于测试集的特征 PSI 过滤。
+# =============================================================================
 
 # 3. 多重共线性：对数值特征采用 Spearman 相关系数衡量单调相关性，阈值设置为 0.95
-features_corr = train_dev[[
+num_candidates_for_corr = [
     col for col in orig_num_cols
     if col not in high_primary_value_ratio
-    and col not in high_psi
-]].corr(method='spearman')
+]
+features_corr = train_dev[num_candidates_for_corr].corr(method='spearman')
 
 result = features_corr.stack().reset_index()
 result.columns = ['feature1', 'feature2', 'corr']
 result = result[np.abs(result['corr']).between(0.95, 1, inclusive='left')]
 
-psi_dict = dict(zip(cols_eda['Row'], cols_eda['psi']))
-psi_dict.update(derived_psi.to_dict())
-result['psi1'] = result['feature1'].map(psi_dict).fillna(0)
-result['psi2'] = result['feature2'].map(psi_dict).fillna(0)
-high_corr = result.loc[result['psi1'] > result['psi2'], 'feature1'].tolist()
+# 【数据泄露防范批注 / Data Leakage Prevention Note】:
+# 原代码在消除多重共线性特征时，利用测试集计算的 psi1 与 psi2 进行比较 (result['psi1'] > result['psi2'])，
+# 剔除在测试集上 PSI 较高的共线特征。这同样利用了测试集信息，构成数据泄露。
+# 现已重构为纯粹基于开发训练集自身信息（缺失率）消除共线性：
+# 针对高相关性特征对 (|r| >= 0.95)，优先保留开发集上缺失率更低（信息更完整）的特征；
+# 若缺失率相同，按字段名称字典序做确定性剔除，彻底杜绝测试集信息渗透。
+missing_dict = train_dev[orig_num_cols].isna().mean().to_dict()
+result['missing1'] = result['feature1'].map(missing_dict)
+result['missing2'] = result['feature2'].map(missing_dict)
+high_corr = result.loc[
+    (result['missing1'] > result['missing2']) | 
+    ((result['missing1'] == result['missing2']) & (result['feature1'] > result['feature2'])),
+    'feature1'
+].tolist()
 
-del result, psi_dict, derived_psi
+del result, missing_dict, num_candidates_for_corr
 
-# 粗筛需要剔除的特征清单
-delete_feature = set(high_primary_value_ratio + high_psi + high_corr)
+# 粗筛需要剔除的特征清单（仅基于开发训练集自身的数据质量与共线性指标）
+delete_feature = set(high_primary_value_ratio + high_corr)
 
-# 初筛后的候选特征集（包含保留的优质原始特征与稳定衍生特征）
+# 初筛后的候选特征集（包含保留的优质原始特征与衍生特征）
 candidate_feature_cols = [
     col for col in all_feature_cols
     if col not in delete_feature
 ]
 
-del orig_num_cols, high_primary_value_ratio, high_psi, features_corr
+del orig_num_cols, high_primary_value_ratio, features_corr
 del ignore_cols, all_feature_cols, derived_cols, high_corr, delete_feature, cols_eda
 gc.collect()
 
@@ -498,9 +516,9 @@ eval_summary_df = pd.DataFrame({
 eval_summary_df.to_csv(MODEL_OUTPUT_PATH / 'lgb_eval_summary.csv', index=False)
 
 #                             数据集     样本量     AUC      KS   跨客群预测概率 PSI
-# 0  开发训练集 (Train Dev 5-Fold OOF)  246008  0.7601  0.3841  基准 (0.00000)
-# 1           闭卷验证集 (Valid Blind)   61503  0.7572  0.3879             -
-# 2         官方测试集 (Official Test)   48744       -       -       0.00421
+# 0  开发训练集 (Train Dev 5-Fold OOF)  246008  0.7676  0.3988  基准 (0.00000)
+# 1           闭卷验证集 (Valid Blind)   61503  0.7657  0.3979             -
+# 2         官方测试集 (Official Test)   48744       -       -       0.00170
 
 # 清理最终训练与验证过程中的临时变量与特征集副本
 del fold, train_idx, valid_idx, X_tr, y_tr, X_va, y_va, clf, val_pred

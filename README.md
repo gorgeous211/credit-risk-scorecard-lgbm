@@ -1,4 +1,5 @@
 # Home Credit Default Risk: 信贷违约预测与双轨建模
+
 # Home Credit Default Risk: Dual-Track Modeling Pipeline (Scorecard & LightGBM)
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/) [![LightGBM](https://img.shields.io/badge/Model-LightGBM-brightgreen.svg)](https://lightgbm.readthedocs.io/) [![Scorecard](https://img.shields.io/badge/Model-Scorecard%20(OptBinning)-orange.svg)](https://gnpalencia.org/optbinning/) [![Validation](https://img.shields.io/badge/Validation-Zero%20Data%20Leakage-red.svg)](#) [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
@@ -36,24 +37,24 @@
 
 #### 2.1 模型综合性能指标对比
 
-| 模型架构 | 数据集划分 | 样本量 | 区分度 (ROC-AUC) | 鉴别力 (KS) | 跨客群稳定性 (PSI) | 核心特性说明 |
-| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
-| **LightGBM (5折CV + Optuna)** | 开发训练集 (Train Dev OOF) | 246,008 | **0.7601** | **0.3841** | 基准 (0.00000) | 5折交叉验证集成，综合非线性捕获能力强 |
-| **LightGBM (5折CV + Optuna)** | 闭卷验证集 (Valid Blind) | 61,503 | **0.7572** | **0.3879** | — | 独立封存无偏差盲测评估 |
-| **LightGBM (5折CV + Optuna)** | 官方测试集 (Official Test) | 48,744 | — | — | **0.00421** | 跨客群表现稳定 (PSI < 0.10) |
-| **标准信用评分卡 (OptBinning)** | 开发训练集 (Train Dev) | 246,008 | 0.7517 | 0.3749 | 基准 (0.00000) | 单调WOE + VIF + 逐步回归，纯整数分值 |
-| **标准信用评分卡 (OptBinning)** | 闭卷验证集 (Valid Blind) | 61,503 | 0.7470 | 0.3681 | — | 独立封存无偏差盲测评估 |
-| **标准信用评分卡 (OptBinning)** | 官方测试集 (Official Test) | 48,744 | — | — | **0.00157** | 跨客群表现稳定 (PSI < 0.10) |
+| 模型架构                         | 数据集划分                 | 样本量     | 区分度 (ROC-AUC) | 鉴别力 (KS)   | 跨客群稳定性 (PSI) | 核心特性说明                   |
+|:---------------------------- |:--------------------- |:-------:|:-------------:|:----------:|:------------:|:------------------------ |
+| **LightGBM (5折CV + Optuna)** | 开发训练集 (Train Dev OOF) | 246,008 | **0.7676**    | **0.3988** | 基准 (0.00000) | 5折交叉验证集成，综合非线性捕获能力强      |
+| **LightGBM (5折CV + Optuna)** | 闭卷验证集 (Valid Blind)   | 61,503  | **0.7657**    | **0.3979** | —            | 独立封存无偏差盲测评估              |
+| **LightGBM (5折CV + Optuna)** | 官方测试集 (Official Test) | 48,744  | —             | —          | **0.00170**  | 跨客群表现稳定 (PSI < 0.10)     |
+| **标准信用评分卡 (OptBinning)**     | 开发训练集 (Train Dev)     | 246,008 | 0.7517        | 0.3749     | 基准 (0.00000) | 单调WOE + VIF + 逐步回归，纯整数分值 |
+| **标准信用评分卡 (OptBinning)**     | 闭卷验证集 (Valid Blind)   | 61,503  | 0.7470        | 0.3681     | —            | 独立封存无偏差盲测评估              |
+| **标准信用评分卡 (OptBinning)**     | 官方测试集 (Official Test) | 48,744  | —             | —          | **0.00157**  | 跨客群表现稳定 (PSI < 0.10)     |
 
-> **群体稳定性指标（PSI）**：常用标准中 PSI < 0.10 表示客群分布基本无变化。评分卡总分与 LightGBM 预测概率在测试集上的 PSI 分别为 0.00157 和 0.00421，未见明显客群漂移。
+> **群体稳定性指标（PSI）**：常用标准中 PSI < 0.10 表示客群分布基本无变化。评分卡总分与 LightGBM 预测概率在测试集上的 PSI 分别为 0.00157 和 0.00170，未见明显客群漂移。严格遵循 Zero Data Leakage 规范：特征筛选阶段完全基于训练集自身质量与 IV 指标，不依赖测试集进行 PSI 筛选；仅在最终模型确定后报告测试集的宏观模型稳定性 PSI。
 
 #### 2.2 样本分层审计账本 (`split_audit.csv`)
 
-| 数据集 | 样本量 | 样本占比 | 正常客户 (0) | 违约客户 (1) | 坏账率 (Bad Rate) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| 原始训练集 (Raw Train) | 307,511 | 100.00% | 282,686 | 24,825 | 8.0729% |
-| **开发训练集 (Train Dev)** | 246,008 | 80.00% | 226,148 | 19,860 | 8.0729% |
-| **闭卷验证集 (Valid Blind)** | 61,503 | 20.00% | 56,538 | 4,965 | 8.0728% |
+| 数据集                     | 样本量     | 样本占比    | 正常客户 (0) | 违约客户 (1) | 坏账率 (Bad Rate) |
+|:----------------------- |:-------:|:-------:|:--------:|:--------:|:--------------:|
+| 原始训练集 (Raw Train)       | 307,511 | 100.00% | 282,686  | 24,825   | 8.0729%        |
+| **开发训练集 (Train Dev)**   | 246,008 | 80.00%  | 226,148  | 19,860   | 8.0729%        |
+| **闭卷验证集 (Valid Blind)** | 61,503  | 20.00%  | 56,538   | 4,965    | 8.0728%        |
 
 ---
 
@@ -76,24 +77,24 @@
    ┌────────┴────────┐                                            │
    ▼                 ▼                                            │
 01_eda.py    02_adversarial_validation.py                         │
-(特征体检账本)  (LightGBM 探测跨期宏观漂移)                           │
+(特征体检账本)  (LightGBM 探测跨期宏观漂移)                            │
    │                 │                                            │
    └────────┬────────┘                                            │
             ▼                                                     │
 03_feature_engineering.py                                         │
-(8大维度特征衍生 + IV/PSI 初筛 + 贪心去共线)                          │
+(8大维度特征衍生 + 纯训练集 IV 初筛 + 贪心去共线)                       │
             │                                                     │
             ├─────────────────────────────────┐                   │
             ▼                                 ▼                   │
 04_scorecard_modeling.py             05_lightgbm_modeling.py      │
-- 单调分箱 & WOE 编码                 - 5折交叉验证 OOF              │
-- VIF <= 5 多重共线性消除             - 累计 Gain 精筛 (Top 95%)   │
-- 逐步回归 (AIC) & 负符号约束          - Optuna TPE 贝叶斯调参        │
-- PDO=20, 600 基准分刻度映射          - 浅树强正则抗噪约束          │
+- 单调分箱 & WOE 编码                 - 5折交叉验证 OOF               │
+- VIF <= 5 多重共线性消除             - 累计 Gain 精筛 (Top 95%)      │
+- 逐步回归 (AIC) & 负符号约束          - Optuna TPE 贝叶斯调参         │
+- PDO=20, 600 基准分刻度映射          - 浅树强正则抗噪约束              │
             │                                 │                   │
             └────────────────┬────────────────┘                   │
                              ▼                                    │
-                    [ 统一闭卷映射与盲测验证 ] ◄────────────────────┘
+                    [ 统一闭卷映射与盲测验证 ] ◄─────────────────────┘
                              │
             ┌────────────────┴────────────────┐
             ▼                                 ▼
@@ -111,7 +112,7 @@
 - **`baseline/02_adversarial_validation.py`**：
   以“是否属于测试集”（`is_test`）为标签训练 LightGBM，通过浅树与限制叶节点样本（`max_depth=5, num_leaves=16, min_child_samples=50`）检查训练集与测试集的分布差异，保存特征重要性表至 `adversarial_validation_feature_importance.csv`。
 - **`baseline/03_feature_engineering.py`**：
-  衍生 8 个维度的业务特征；仅在开发集上拟合 OptBinning，结合质量指标、IV >= 0.02、PSI <= 0.25、房屋特征去重以及 Spearman 秩相关系数贪心剔除（|r| > 0.80），筛选出 40 个候选特征。
+  衍生 8 个维度的业务特征；仅在开发集上拟合 OptBinning，结合质量指标、IV >= 0.02（彻底去除对测试集的 PSI 筛选，严防数据泄露）、房屋特征去重以及 Spearman 秩相关系数贪心剔除（|r| > 0.80），筛选出 40 个候选特征。
 - **`baseline/04_scorecard_modeling.py`**：
   构建标准信用评分卡。对学历做单调有序映射，通过 VIF 检验消除多重共线性（控制在 5 以内），使用双向逐步回归（AIC）并检查系数符号（确保均为负号）。按基准好坏比设定 PDO = 20、基准分 600 分，导出分箱得分表 `final_scorecard_table.csv`。
 - **`baseline/05_lightgbm_modeling.py`**：
@@ -265,24 +266,24 @@ Model performance was evaluated on the holdout validation set and the unlabelled
 
 #### 2.1 Model performance comparison
 
-| Model Framework | Dataset Split | Sample Size | ROC-AUC | KS Statistic | Population Stability (PSI) | Key Highlights |
-| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
-| **LightGBM (5-Fold CV + Optuna)** | Train Dev (5-Fold OOF) | 246,008 | **0.7601** | **0.3841** | Baseline (0.00000) | 5-fold CV ensemble capturing non-linear interactions |
-| **LightGBM (5-Fold CV + Optuna)** | Valid Blind | 61,503 | **0.7572** | **0.3879** | — | Unbiased holdout validation |
-| **LightGBM (5-Fold CV + Optuna)** | Official Test | 48,744 | — | — | **0.00421** | Stable score distribution (PSI < 0.10) |
-| **Standard Scorecard (OptBinning)** | Train Dev | 246,008 | 0.7517 | 0.3749 | Baseline (0.00000) | Monotonic WOE, VIF <= 5, stepwise logistic regression |
-| **Standard Scorecard (OptBinning)** | Valid Blind | 61,503 | 0.7470 | 0.3681 | — | Unbiased holdout validation |
-| **Standard Scorecard (OptBinning)** | Official Test | 48,744 | — | — | **0.00157** | Stable score distribution (PSI < 0.10) |
+| Model Framework                     | Dataset Split          | Sample Size | ROC-AUC    | KS Statistic | Population Stability (PSI) | Key Highlights                                        |
+|:----------------------------------- |:---------------------- |:-----------:|:----------:|:------------:|:--------------------------:|:----------------------------------------------------- |
+| **LightGBM (5-Fold CV + Optuna)**   | Train Dev (5-Fold OOF) | 246,008     | **0.7676** | **0.3988**   | Baseline (0.00000)         | 5-fold CV ensemble capturing non-linear interactions  |
+| **LightGBM (5-Fold CV + Optuna)**   | Valid Blind            | 61,503      | **0.7657** | **0.3979**   | —                          | Unbiased holdout validation                           |
+| **LightGBM (5-Fold CV + Optuna)**   | Official Test          | 48,744      | —          | —            | **0.00170**                | Stable score distribution (PSI < 0.10)                |
+| **Standard Scorecard (OptBinning)** | Train Dev              | 246,008     | 0.7517     | 0.3749       | Baseline (0.00000)         | Monotonic WOE, VIF <= 5, stepwise logistic regression |
+| **Standard Scorecard (OptBinning)** | Valid Blind            | 61,503      | 0.7470     | 0.3681       | —                          | Unbiased holdout validation                           |
+| **Standard Scorecard (OptBinning)** | Official Test          | 48,744      | —          | —            | **0.00157**                | Stable score distribution (PSI < 0.10)                |
 
-> **Population Stability Index (PSI)**: By conventional standards, PSI < 0.10 indicates negligible population shift. Test set PSI was 0.00157 for scorecard points and 0.00421 for LightGBM default probabilities, showing consistent score distributions between train and test.
+> **Population Stability Index (PSI)**: By conventional standards, PSI < 0.10 indicates negligible population shift. Test set PSI was 0.00157 for scorecard points and 0.00170 for LightGBM default probabilities, showing consistent score distributions between train and test. Following zero-leakage guidelines, feature screening relies strictly on training development set metrics without test PSI pre-filtering.
 
 #### 2.2 Stratified split audit ledger (`split_audit.csv`)
 
-| Dataset Partition | Sample Count | Percentage | Non-Default (0) | Default (1) | Bad Rate |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| Raw Training Table | 307,511 | 100.00% | 282,686 | 24,825 | 8.0729% |
-| **Train Dev (Development Set)** | 246,008 | 80.00% | 226,148 | 19,860 | 8.0729% |
-| **Valid Blind (Hold-Out Set)** | 61,503 | 20.00% | 56,538 | 4,965 | 8.0728% |
+| Dataset Partition               | Sample Count | Percentage | Non-Default (0) | Default (1) | Bad Rate |
+|:------------------------------- |:------------:|:----------:|:---------------:|:-----------:|:--------:|
+| Raw Training Table              | 307,511      | 100.00%    | 282,686         | 24,825      | 8.0729%  |
+| **Train Dev (Development Set)** | 246,008      | 80.00%     | 226,148         | 19,860      | 8.0729%  |
+| **Valid Blind (Hold-Out Set)**  | 61,503       | 20.00%     | 56,538          | 4,965       | 8.0728%  |
 
 ---
 
@@ -308,7 +309,7 @@ Model performance was evaluated on the holdout validation set and the unlabelled
    └────────┬────────┘                                            │
             ▼                                                     │
 03_feature_engineering.py                                         │
-(8 Risk Dimensions + IV/PSI Funnel + Greedy Corr Elimination)     │
+(8 Risk Dimensions + Training IV Funnel + Greedy Corr Elimination)│
             │                                                     │
             ├─────────────────────────────────┐                   │
             ▼                                 ▼                   │
@@ -338,7 +339,7 @@ Model performance was evaluated on the holdout validation set and the unlabelled
 - **`baseline/02_adversarial_validation.py`**:
   Trains a LightGBM model to predict whether a sample belongs to the test set (`is_test`). Constrained hyperparameters (`max_depth=5`, `num_leaves=16`, `min_child_samples=50`) measure macro-level drift (AUC = 0.89) and save rankings to `adversarial_validation_feature_importance.csv`.
 - **`baseline/03_feature_engineering.py`**:
-  Derives risk features across eight domains. Fits OptBinning on the development set only, filters by data quality, IV >= 0.02, and PSI <= 0.25, removes redundant housing fields, and applies greedy Spearman correlation pruning (|r| > 0.80) to select 40 candidate features.
+  Derives risk features across eight domains. Fits OptBinning on the development set only, filters by data quality, IV >= 0.02 (zero test PSI filtering to eliminate data leakage), removes redundant housing fields, and applies greedy Spearman correlation pruning (|r| > 0.80) to select 40 candidate features.
 - **`baseline/04_scorecard_modeling.py`**:
   Builds a standard scorecard. Maps education to monotonic integer tiers, eliminates collinearity with iterative VIF pruning (VIF <= 5), runs bidirectional stepwise logistic regression (AIC), and verifies that all coefficients remain negative. Applies PDO = 20 and Base = 600 scaling to write `final_scorecard_table.csv`.
 - **`baseline/05_lightgbm_modeling.py`**:

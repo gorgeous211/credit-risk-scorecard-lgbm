@@ -30,7 +30,15 @@
 
 # %%
 import gc
+import os
+import sys
 from pathlib import Path
+
+# Windows 环境下确保当前虚拟环境的 Library/bin 优先加载，防止 LAPACK/OpenBLAS DLL 符号解析冲突
+dll_path = os.path.join(sys.prefix, "Library", "bin")
+if os.path.exists(dll_path):
+    os.add_dll_directory(dll_path)
+    os.environ["PATH"] = dll_path + os.pathsep + os.environ.get("PATH", "")
 
 import numpy as np
 import pandas as pd

@@ -8,8 +8,8 @@
 # 2. 全量原始训练表 application_train.csv 和闭卷验证集 application_valid_blind.csv 
 #    严禁参与本阶段的特征衍生规则拟合、分箱拟合（fit）、IV 计算与多变量相关性筛选，
 #    彻底杜绝数据穿越（Data Leakage）；
-# 3. 官方未标注测试集 application_test.csv 没有 TARGET 标签，仅作为跨客群分布参照，
-#    用于计算开发集与官方测试集之间的 PSI 稳定性指标；
+# 3. 官方未标注测试集 application_test.csv 没有 TARGET 标签，仅应用开发集相同的特征工程变换
+#    生成 processed/test_fe.csv 以供最终模型评估预测，严禁参与任何特征筛选环节（避免测试集 PSI 数据泄露）；
 # 4. 逻辑回归评分卡通常只保留 10~20 个核心特征。塞入大量弱特征不仅无法提升 KS 和 AUC，
 #    反而会引入噪声、增加共线性风险，导致权重失真甚至符号反转。
 # =============================================================================
@@ -324,46 +324,63 @@ binning_process = BinningProcess(
 )
 binning_process.fit(train_dev[filtered_candidates], train_dev['TARGET'])
 
+# 计算分箱后特征的 IV 值
+
+# ==============================================================================
+# 特征信息价值 (IV) 评价与筛选标准
+# ------------------------------------------------------------------------------
+# IV < 0.02          | 无有效预测力 | 剔除，减少不必要的自由度损失
+# 0.02 <= IV < 0.10  | 弱预测力     | 视业务逻辑辅助保留
+# 0.10 <= IV < 0.30  | 中等预测力   | 评分卡的主力入模特征
+# 0.30 <= IV < 0.50  | 强预测力     | 核心判别变量（如外部征信机构评分）
+# IV >= 0.50         | 极高预测力   | 需重点复核，防范未来信息渗透或目标泄露
+# ==============================================================================
+
 iv_summary_df = binning_process.summary().rename(columns={'name': 'feature'})
 iv_dict = dict(zip(iv_summary_df['feature'], iv_summary_df['iv']))
 
-# 3. 跨客群稳定性指标 PSI 统一计算
-train_bins = pd.DataFrame(
-    binning_process.transform(train_dev[filtered_candidates], metric="bins"),
-    columns=filtered_candidates,
-    index=train_dev.index
-)
-test_bins = pd.DataFrame(
-    binning_process.transform(application_test[filtered_candidates], metric="bins"),
-    columns=filtered_candidates,
-    index=application_test.index
-)
-psi_series = toad.metrics.PSI(test_bins[filtered_candidates], train_bins[filtered_candidates])
-psi_dict = psi_series.to_dict()
-
-del train_bins, test_bins, binning_process
+del binning_process
 gc.collect()
 
-# 汇总全量特征体检表
+# 汇总全量特征体检表（仅基于开发训练集自身属性，严禁引入测试集）
 feature_stats = pd.DataFrame({
     'Row': filtered_candidates,
     'iv': [iv_dict.get(c, np.nan) for c in filtered_candidates],
-    'psi': [psi_dict.get(c, np.nan) for c in filtered_candidates],
     'missing_rate': [missing_rates.get(c, np.nan) for c in filtered_candidates],
     'primary_value_ratio': [primary_value_ratios.get(c, np.nan) for c in filtered_candidates],
     'dtypes': [train_dev[c].dtype.name for c in filtered_candidates],
     'is_derived': [c not in cols_eda['Row'].values for c in filtered_candidates]
 })
 
-# 4. 指标阈值统一初筛：保留 IV >= 0.02 且 PSI <= 0.25 的特征
+# ==============================================================================
+# 3. 指标阈值统一初筛：仅保留开发集 IV >= 0.02 的特征
+# ------------------------------------------------------------------------------
+# 【数据泄露防范批注 / Data Leakage Prevention Note】:
+# 原代码在此处计算了开发训练集与官方测试集 (application_test) 之间的单特征 PSI，
+# 并基于 `(feature_stats['iv'] >= 0.02) & (feature_stats['psi'] <= 0.25)` 进行了特征初筛。
+# 现已彻底去除在特征筛选阶段对 PSI 的筛选，原因如下：
+# 1. 严格禁止测试集信息穿越（Zero Data Leakage 原则）：
+#    测试集（Official Test / 盲测集）在真实生产环境与风控审计中代表未来的未知客群（Out-Of-Time / Unseen Data），
+#    在模型构建、特征工程与特征筛选阶段必须保持绝对盲态与完全不可见性。
+#    若在特征工程和筛选阶段读取测试集计算特征级 PSI，并以此决定特征的取舍，实质上是利用了未标注测试集的
+#    边际分布先验，属于典型的无监督数据泄露（Unsupervised Data Snooping / Data Leakage）。
+# 2. 避免对未知分布的虚假过拟合与评估失真：
+#    在特征筛选环节提前剔除在测试集上 PSI 偏高的特征，会导致模型特征集被人为定向拟合到该特定测试集的分布，
+#    使得最终在测试集上评估的泛化能力指标（如 AUC、KS）和模型输出总分 PSI 呈现虚假乐观的良好表现，
+#    掩盖了模型面对真实未知客群或未来时间窗口分布漂移时的脆弱性，失去客观评估泛化能力的意义。
+# 3. PSI 的正确定位是事后监控与后验评估工具：
+#    群体稳定性指标（PSI）属于模型生命周期中的事后监控（Monitoring）与后验验证（Evaluation）指标。
+#    正规风控流程是在模型构建完成并冻结后，将模型应用于测试集或生产环境，通过评估模型输出的
+#    总分/预测概率分布的整体 PSI 来检验模型的稳定性，绝不能将测试集 PSI 逆向作为前置特征准入硬门槛。
+#    因此，前端特征筛选应严格仅依赖开发训练集内部的信息价值（IV）、缺失率、主值占比及业务风险逻辑。
+# ==============================================================================
 low_iv_cols = feature_stats[feature_stats['iv'] < 0.02]['Row'].tolist()
-high_psi_cols = feature_stats[feature_stats['psi'] > 0.25]['Row'].tolist()
 
 metric_passed_stats = feature_stats[
-    (feature_stats['iv'] >= 0.02) & (feature_stats['psi'] <= 0.25)
+    feature_stats['iv'] >= 0.02
 ].sort_values(by='iv', ascending=False).reset_index(drop=True)
 
-del low_iv_cols, high_psi_cols, quality_drop_cols
+del low_iv_cols, quality_drop_cols
 gc.collect()
 
 # %%

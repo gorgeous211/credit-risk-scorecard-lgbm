@@ -293,20 +293,6 @@ missing_summary_nonzero = missing_summary_nonzero.merge(
 ''' -> 缺失率较高的字段大部分是与房屋相关
     -> 说明一部分申请人缺少相关房屋信息，而不是数据随机缺失 '''
 
-# 输出缺失率排名图
-# sns.barplot(
-#     data=missing_summary_nonzero.sort_values(by='missing_rate', ascending=False).head(30),
-#     x='missing_rate',
-#     y='Row')
-
-# sns.barplot(
-#     data=missing_summary_nonzero.loc[
-#         ~missing_summary_nonzero['Description'].str.startswith('Normalized'),
-#         ['Row', 'missing_rate']
-#         ].sort_values(by='missing_rate', ascending=False),
-#     x='missing_rate',
-#     y='Row')
-
 cols_eda.to_csv(EDA_OUTPUT_PATH / 'cols_eda.csv', index=False)
 
 # 清理缺失率统计与模式核验中间变量
@@ -477,6 +463,8 @@ test_bins = pd.DataFrame(
 
 
 # 在相同分箱标签上直接计算 PSI（toad 参数顺序为 test、base）。
+# 【注意 / Warning】: 此处计算的单特征 PSI 仅供宏观探索分析与数据分布体检报告（只读参照），
+# 严禁将此处的测试集单特征 PSI 传递到下游特征工程与特征筛选环节作为剔除门槛，以防数据泄露。
 psi_summary = toad.metrics.PSI(
     test_bins[feature_cols],
     train_bins[feature_cols]
