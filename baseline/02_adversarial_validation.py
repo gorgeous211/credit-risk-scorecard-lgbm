@@ -17,18 +17,18 @@ VALIDATION_OUTPUT_PATH = OUTPUTS_PATH / "validation"
 VALIDATION_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 # 主申请表
-application_train = pd.read_csv(DATA_PATH / 'raw' / 'application_train.csv').drop(
+train = pd.read_csv(DATA_PATH / 'raw' / 'application_train.csv').drop(
     columns=['SK_ID_CURR', 'TARGET']
 )
-application_test = pd.read_csv(DATA_PATH / 'raw' / 'application_test.csv').drop(columns='SK_ID_CURR')
+test = pd.read_csv(DATA_PATH / 'raw' / 'application_test.csv').drop(columns='SK_ID_CURR')
 
 # %%
 # 标记训练集和测试集
-application_train['is_test'] = 0
-application_test['is_test'] = 1
+train['is_test'] = 0
+test['is_test'] = 1
 
 # 合并训练集和测试集
-application = pd.concat([application_train, application_test], ignore_index=True)
+application = pd.concat([train, test], ignore_index=True)
 
 # 类别特征转换为category类型，使lightgbm可以直接处理
 obj_cols = application.select_dtypes(include='object').columns

@@ -1,44 +1,25 @@
 # %%
 # =============================================================================
-# 逻辑回归标准评分卡建模与评估（Scorecard Modeling & Evaluation）
+# 逻辑回归标准信用评分卡建模与评估
+# (Scorecard Modeling & Multi-Stage Screening Pipeline)
 # =============================================================================
-# 数据隔离与评估规范（严格遵循 00_stratified_split.py 与 03_feature_engineering.py 约定）：
-# 1. 开发训练集（Train Dev, 80%）：
-#    读取 data/processed/train_fe.csv（由 03_feature_engineering.py 基于
-#    application_train_dev.csv 加工完成，包含初筛后的 40 个候选特征）。
-#    作为特征分箱拟合（fit）、WOE 编码、多变量共线性剔除、逐步回归筛选及评分卡模型训练的唯一输入。
-# 2. 闭卷验证集（Valid Blind, 20%）：
-#    读取 data/interim/application_valid_blind.csv。在建模完成前完全独立封存，
-#    不参与任何规则拟合；仅执行与 03 脚本严格一致的特征清洗与衍生变换（transform），
-#    用于独立客观评估 AUC 与 KS。
-# 3. 官方未标注测试集（Official Test, 4.8 万条）：
-#    读取 data/processed/test_fe.csv（由 03 脚本加工落盘）或从 raw 表执行无监督转换。
-#    无 TARGET 标签，直接输入训练好的模型输出预测分值，用于评估跨客群模型总分 PSI。
-#
-# -- 单箱样本约束 --
-# 单箱样本占比原则上 >= 5%（开发集样本 246,008 时，至少约 12,300 个样本）。
-# 每个分类或分箱中的坏样本数建议不少于 20~30 个；样本过少时应合并分箱，避免 WOE 估计不稳定。
-#
-# -- WOE 分箱质量 --
-# 1. 组间差异：相邻分类/分箱的 |ΔWOE| 建议 >= 0.10，严格标准可取 0.15；差异过小时考虑合并。
-# 2. 单箱幅度：|WOE| 通常以 0.10~1.50 为较合理范围。
-#    - |WOE| 长期接近 0（如 -0.05~+0.05）：该箱与总体违约率接近，区分信息有限。
-#    - |WOE| 过大（如 > 2.0，尤其 > 3.0）：检查箱内样本/坏样本是否过少，并考虑合并分箱。
-# 3. 趋势与稳定性：有序变量的 WOE 应单调递增或递减；无序变量应检查各箱排序在训练集、测试集及 OOT 样本间是否一致。
-#    不应出现训练集与测试集（或跨时间样本）间 WOE 方向反转。
+# 核心架构定位：
+# 本脚本实现【传统统计评分卡（Logistic Regression）】建模。
+# 直接从统一特征工程输出（data/processed/train_features_full.csv）读取全量候选特征，
+# 执行专属于标准评分卡的端到端漏斗筛选与建模：
+# 1. 学历有序类别映射（强制单调性）；
+# 2. 数据质量与判别力粗筛（同值率 > 95%、缺失率 > 90% 剔除，IV >= 0.02 准入）；
+# 3. 房屋同源去重与贪心共线性消除（Spearman |r| >= 0.80，保留高 IV 者）；
+# 4. OptBinning 精细约束分箱（单箱占比 >= 5%，坏样本 >= 30，严格单调与比率 U 型放宽）；
+# 5. WOE 编码与多变量共线性排查（WOE 相关性过滤、常数截距 VIF <= 5 诊断）；
+# 6. 双向逐步回归（AIC 准则）与回归系数符号反转校验（严防风险与评分倒挂）；
+# 7. PDO 刻度映射（基准分 600 分，PDO = 20，Odds = 11.39，输出整数加减分明细表）；
+# 8. 独立验证集（AUC / KS）评估与测试集总分 PSI 跨客群稳定性验证。
 # =============================================================================
 
 # %%
 import gc
-import os
-import sys
 from pathlib import Path
-
-# Windows 环境下确保当前虚拟环境的 Library/bin 优先加载，防止 LAPACK/OpenBLAS DLL 符号解析冲突
-dll_path = os.path.join(sys.prefix, "Library", "bin")
-if os.path.exists(dll_path):
-    os.add_dll_directory(dll_path)
-    os.environ["PATH"] = dll_path + os.pathsep + os.environ.get("PATH", "")
 
 import numpy as np
 import pandas as pd
@@ -52,10 +33,7 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 # 文件路径配置
 DATA_PATH = Path.cwd() / "data"
-RAW_DATA_PATH = DATA_PATH / "raw"
-INTERIM_DATA_PATH = DATA_PATH / "interim"
 PROCESSED_DATA_PATH = DATA_PATH / "processed"
-
 OUTPUTS_PATH = Path.cwd() / "outputs"
 EDA_OUTPUT_PATH = OUTPUTS_PATH / "eda"
 MODEL_OUTPUT_PATH = OUTPUTS_PATH / "models"
@@ -63,25 +41,17 @@ MODEL_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 # %%
 # =============================================================================
-# 1. 数据集读取与特征准备
+# 1. 数据集读取与候选特征池准备
 # =============================================================================
-# (1) 开发训练集（Train Dev, 80%）：读取由 03 脚本初筛落盘的入模候选特征及 TARGET
-train_fe = pd.read_csv(PROCESSED_DATA_PATH / 'train_fe.csv')
-X_train = train_fe.drop(columns='TARGET').copy()
-y_train = train_fe['TARGET'].copy()
-del train_fe
+print("正在加载统一特征工程全量宽表...")
+train_df = pd.read_csv(PROCESSED_DATA_PATH / 'train_features_full.csv')
+valid_df = pd.read_csv(PROCESSED_DATA_PATH / 'valid_features_full.csv')
+test_df = pd.read_csv(PROCESSED_DATA_PATH / 'test_features_full.csv')
 
-# (2) 闭卷验证集（Valid Blind, 20%）：封存集，含 TARGET
-valid_blind = pd.read_csv(INTERIM_DATA_PATH / 'application_valid_blind.csv')
-y_valid = valid_blind['TARGET'].copy()
+y_train = train_df['TARGET'].copy()
+y_valid = valid_df['TARGET'].copy()
 
-# 读取 EDA 全量特征质量账本以获取房屋特征列表（与 03 脚本完全一致）
-cols_eda = pd.read_csv(EDA_OUTPUT_PATH / 'cols_eda.csv')
-house_cols = cols_eda.loc[
-    cols_eda['Description'].str.startswith('Normalized information'), 'Row'
-].tolist()
-
-# 学历有序类别映射（强制单调性）
+# 学历有序类别映射（在特征筛选前完成数值单调化）
 edu_mapping = {
     'Lower secondary': 1,
     'Secondary / secondary special': 2,
@@ -89,176 +59,183 @@ edu_mapping = {
     'Higher education': 4,
     'Academic degree': 5
 }
-X_train['NAME_EDUCATION_TYPE'] = X_train['NAME_EDUCATION_TYPE'].map(edu_mapping)
+for df_obj in [train_df, valid_df, test_df]:
+    df_obj['NAME_EDUCATION_TYPE'] = df_obj['NAME_EDUCATION_TYPE'].map(edu_mapping)
 
+ignore_cols = ['SK_ID_CURR', 'TARGET']
+candidate_features = [c for c in train_df.columns if c not in ignore_cols]
 
-def transform_features(df_raw, house_cols_list):
-    """
-    无监督特征映射与转换管道：
-    对闭卷验证集 (Valid Blind) 和官方测试集 (Official Test) 执行与 03_feature_engineering.py
-    严格一致的异常值清洗、高阶业务衍生与有序类别数值化映射。
-    全程不进行任何规则拟合或参数学习，杜绝数据穿越。
-    """
-    df = df_raw.copy()
+print(f"数据加载完成: 训练集 {train_df.shape}, 验证集 {valid_df.shape}, 测试集 {test_df.shape}")
+print(f"评分卡初始候选特征数: {len(candidate_features)}")
 
-    # 1. 异常值清洗与特殊标记（与 03 脚本完全一致）
-    df['FLAG_DAYS_EMPLOYED_ANOMALOUS'] = (df['DAYS_EMPLOYED'] == 365243).astype(int)
-    df['DAYS_EMPLOYED'] = df['DAYS_EMPLOYED'].replace(365243, np.nan)
-    df['CODE_GENDER'] = df['CODE_GENDER'].replace('XNA', 'F')
-    df.loc[df['OBS_30_CNT_SOCIAL_CIRCLE'] > 30, 'OBS_30_CNT_SOCIAL_CIRCLE'] = np.nan
-    df.loc[df['OBS_60_CNT_SOCIAL_CIRCLE'] > 30, 'OBS_60_CNT_SOCIAL_CIRCLE'] = np.nan
-
-    # 2. 高阶业务特征衍生（与 03 脚本完全一致）
-    # 2.1 还款能力与负债压力
-    df['CREDIT_TO_INCOME_RATIO'] = df['AMT_CREDIT'] / df['AMT_INCOME_TOTAL']
-    df['ANNUITY_TO_INCOME_RATIO'] = df['AMT_ANNUITY'] / df['AMT_INCOME_TOTAL']
-    df['FREE_INCOME_PROXY'] = df['AMT_INCOME_TOTAL'] - df['AMT_ANNUITY']
-    df['INCOME_PER_PERSON'] = df['AMT_INCOME_TOTAL'] / df['CNT_FAM_MEMBERS']
-    df['INCOME_PER_CHILD'] = df['AMT_INCOME_TOTAL'] / (1 + df['CNT_CHILDREN'])
-
-    # 2.2 贷款条件与期限结构
-    df['ANNUITY_TO_CREDIT_RATIO'] = df['AMT_ANNUITY'] / df['AMT_CREDIT']
-    df['ESTIMATED_TENURE'] = df['AMT_CREDIT'] / df['AMT_ANNUITY']
-    df['GOODS_TO_CREDIT_RATIO'] = df['AMT_GOODS_PRICE'] / df['AMT_CREDIT']
-    df['DOWN_PAYMENT_PROXY'] = df['AMT_GOODS_PRICE'] - df['AMT_CREDIT']
-    df['ANNUITY_TO_GOODS_RATIO'] = df['AMT_ANNUITY'] / df['AMT_GOODS_PRICE']
-
-    # 2.3 外部征信评分深挖
-    ext_cols = ['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']
-    df['EXT_SOURCE_MEAN'] = df[ext_cols].mean(axis=1)
-    df['EXT_SOURCE_STD'] = df[ext_cols].std(axis=1)
-    df['EXT_SOURCE_MIN'] = df[ext_cols].min(axis=1)
-    df['EXT_SOURCE_MAX'] = df[ext_cols].max(axis=1)
-    df['EXT_SOURCE_PROD'] = df['EXT_SOURCE_1'] * df['EXT_SOURCE_2'] * df['EXT_SOURCE_3']
-    df['EXT_SOURCE_WEIGHTED'] = (
-        df['EXT_SOURCE_1'] * 2 + df['EXT_SOURCE_2'] * 3 + df['EXT_SOURCE_3'] * 5
-    )
-    df['EXT_SOURCE_NAN_CNT'] = df[ext_cols].isna().sum(axis=1)
-    df['EXT_MEAN_TO_CREDIT_RATIO'] = df['EXT_SOURCE_MEAN'] / df['CREDIT_TO_INCOME_RATIO']
-
-    # 2.4 时间变化、稳定性与生命周期交叉
-    df['EMPLOYED_TO_BIRTH_RATIO'] = df['DAYS_EMPLOYED'] / df['DAYS_BIRTH']
-    df['CAR_TO_BIRTH_RATIO'] = df['OWN_CAR_AGE'] / (-df['DAYS_BIRTH'] / 365)
-    df['ID_TO_BIRTH_RATIO'] = df['DAYS_ID_PUBLISH'] / df['DAYS_BIRTH']
-    df['REG_TO_BIRTH_RATIO'] = df['DAYS_REGISTRATION'] / df['DAYS_BIRTH']
-    df['PHONE_TO_BIRTH_RATIO'] = df['DAYS_LAST_PHONE_CHANGE'] / df['DAYS_BIRTH']
-    df['AGE_AT_EMPLOYMENT'] = (-df['DAYS_BIRTH'] + df['DAYS_EMPLOYED']) / 365
-    df['PHONE_TO_EMPLOYED_RATIO'] = df['DAYS_LAST_PHONE_CHANGE'] / df['DAYS_EMPLOYED'].replace(0, np.nan)
-
-    # 2.5 缺失模式与数据采集指示
-    avg_house_cols = [c for c in house_cols_list if c.endswith('AVG')]
-    df['HOUSE_INFO_MISSING_RATE'] = df[avg_house_cols].isna().mean(axis=1)
-    df['FLAG_OWN_CAR_MISSING'] = df['OWN_CAR_AGE'].isna().astype(int)
-    df['TOTAL_NAN_COUNT'] = df.isna().sum(axis=1)
-
-    # 2.6 身份真实性、反欺诈与社交圈风险
-    doc_cols = [f"FLAG_DOCUMENT_{i}" for i in range(2, 22)]
-    df['DOCUMENTS_PROVIDED_CNT'] = df[doc_cols].sum(axis=1)
-
-    addr_cols = [
-        'REG_CITY_NOT_LIVE_CITY', 'REG_CITY_NOT_WORK_CITY', 'LIVE_CITY_NOT_WORK_CITY',
-        'REG_REGION_NOT_LIVE_REGION', 'REG_REGION_NOT_WORK_REGION', 'LIVE_REGION_NOT_WORK_REGION'
-    ]
-    df['ADDRESS_MISMATCH_MEAN'] = df[addr_cols].mean(axis=1)
-
-    df['DEF_OBS_RATIO_30'] = df['DEF_30_CNT_SOCIAL_CIRCLE'] / df['OBS_30_CNT_SOCIAL_CIRCLE'].replace(0, np.nan)
-    df['DEF_OBS_RATIO_60'] = df['DEF_60_CNT_SOCIAL_CIRCLE'] / df['OBS_60_CNT_SOCIAL_CIRCLE'].replace(0, np.nan)
-
-    # 2.7 征信查询趋势与稳定性改造
-    bureau_cols = [
-        'AMT_REQ_CREDIT_BUREAU_HOUR', 'AMT_REQ_CREDIT_BUREAU_DAY',
-        'AMT_REQ_CREDIT_BUREAU_WEEK', 'AMT_REQ_CREDIT_BUREAU_MON',
-        'AMT_REQ_CREDIT_BUREAU_QRT', 'AMT_REQ_CREDIT_BUREAU_YEAR'
-    ]
-    df['BUREAU_REQ_TOTAL'] = df[bureau_cols].sum(axis=1)
-    df['FLAG_BUREAU_REQ'] = (df['AMT_REQ_CREDIT_BUREAU_YEAR'] > 0).astype(int)
-    short_cols = [
-        'AMT_REQ_CREDIT_BUREAU_HOUR', 'AMT_REQ_CREDIT_BUREAU_DAY',
-        'AMT_REQ_CREDIT_BUREAU_WEEK', 'AMT_REQ_CREDIT_BUREAU_MON'
-    ]
-    df['BUREAU_REQ_SHORT_TO_LONG'] = df[short_cols].sum(axis=1) / (df['AMT_REQ_CREDIT_BUREAU_YEAR'] + 1)
-
-    # 3. 有序类别特征映射
-    df['NAME_EDUCATION_TYPE'] = df['NAME_EDUCATION_TYPE'].map(edu_mapping)
-
-    return df
-
-
-# 对独立闭卷验证集执行与 03 严格一致的无监督转换
-X_valid = transform_features(valid_blind, house_cols)
-
-# (3) 官方未标注测试集（Official Test, 4.8 万条）：跨客群参照，无 TARGET
-# 若 03 脚本已落盘 processed/test_fe.csv 则直接加载，否则从 raw 表执行转换
-test_fe_path = PROCESSED_DATA_PATH / 'test_fe.csv'
-X_test = pd.read_csv(test_fe_path)
-X_test['NAME_EDUCATION_TYPE'] = X_test['NAME_EDUCATION_TYPE'].map(edu_mapping)
-
-del valid_blind, house_cols, cols_eda
-gc.collect()
-
-features = X_train.columns.tolist()
-num_features = X_train.select_dtypes(include='number').columns.tolist()
-cat_features = X_train.select_dtypes(include='object').columns.tolist()
+# 读取原始特征画像与说明表提取房屋相关字段
+raw_features_summary = pd.read_csv(EDA_OUTPUT_PATH / 'raw_features_summary.csv')
+house_cols = raw_features_summary.loc[
+    raw_features_summary['Description'].str.startswith('Normalized information'), 'Row'
+].tolist()
+del raw_features_summary
 
 # %%
 # =============================================================================
-# 2. 精细分箱与 WOE 编码（仅在开发训练集 Train Dev 上拟合）
+# 2. 评分卡专属前置漏斗初筛（质量、IV、房屋去重与相关性）
 # =============================================================================
-# 数值特征：强制单调 (auto_asc_desc 自动判断单调增或单调减，杜绝锯齿波动)
-# 针对典型非线性关系特征（如金额或比率）允许单个拐点 (monotonic_trend="auto")
-# 类别特征：optbinning 自动按各分类 Bad Rate 排序并合并相似风险类别
+# (1) 数据质量粗筛：同值率 > 0.95 或 缺失率 > 0.90
+missing_rates = train_df[candidate_features].isna().mean()
+primary_value_ratios = pd.Series({
+    col: train_df[col].value_counts(dropna=False).iloc[0] / len(train_df)
+    for col in candidate_features
+})
+
+high_pvr_cols = primary_value_ratios[primary_value_ratios > 0.95].index.tolist()
+high_missing_cols = missing_rates[missing_rates > 0.90].index.tolist()
+quality_drop_cols = sorted(list(set(high_pvr_cols + high_missing_cols)))
+
+filtered_candidates = [c for c in candidate_features if c not in quality_drop_cols]
+print(f"✓ 质量初筛完成: 剔除极高同值/缺失字段 {len(quality_drop_cols)} 个，剩余 {len(filtered_candidates)} 个")
+
+# 严谨划分数值列与类别列 (兼容 pandas 2.0+ 与字符串类型)
+num_filtered = train_df[filtered_candidates].select_dtypes(include='number').columns.tolist()
+cat_filtered = [c for c in filtered_candidates if c not in num_filtered]
+
+# (2) 批量最优分箱快速拟合计算 IV（仅在训练集 train_df 上 fit）
+binning_fit_params = {
+    col: {"monotonic_trend": "auto", "cat_cutoff": 0.05}
+    for col in filtered_candidates
+}
+
+binning_process = BinningProcess(
+    variable_names=filtered_candidates,
+    categorical_variables=cat_filtered,
+    max_n_bins=8,
+    min_bin_size=0.02,
+    special_codes=[365243, 'XNA'],
+    binning_fit_params=binning_fit_params,
+    selection_criteria=None,
+    n_jobs=-1
+)
+binning_process.fit(train_df[filtered_candidates], y_train)
+
+iv_summary_df = binning_process.summary().rename(columns={'name': 'feature'})
+iv_dict = dict(zip(iv_summary_df['feature'], iv_summary_df['iv']))
+del binning_process
+gc.collect()
+
+# (3) IV >= 0.02 筛选
+metric_passed_stats = pd.DataFrame({
+    'Row': filtered_candidates,
+    'iv': [iv_dict.get(c, np.nan) for c in filtered_candidates]
+})
+metric_passed_stats = metric_passed_stats[metric_passed_stats['iv'] >= 0.02].sort_values(by='iv', ascending=False).reset_index(drop=True)
+passed_cols = metric_passed_stats['Row'].tolist()
+print(f"✓ IV 阈值准入 (IV >= 0.02): 保留特征 {len(passed_cols)} 个")
+
+# (4) 房屋标准化特征同源后缀去重与跨维度面积共线消除
+passed_house_cols = [c for c in passed_cols if c in house_cols and c in num_filtered]
+house_redundant_drops = []
+house_df = metric_passed_stats[metric_passed_stats['Row'].isin(passed_house_cols)].copy()
+house_df['prefix'] = house_df['Row'].str.split('_').str[0]
+house_df = house_df.sort_values(by=['prefix', 'iv'], ascending=[True, False])
+house_keep = house_df.groupby('prefix')['Row'].head(1).tolist()
+house_suffix_drops = [c for c in passed_house_cols if c not in house_keep]
+house_redundant_drops.extend(house_suffix_drops)
+
+# 跨维度规模共线（APARTMENTS, ELEVATORS, LIVINGAREA, TOTALAREA 相关性 > 0.75）
+apt_rep = [c for c in house_keep if c.startswith('APARTMENTS_')]
+cross_dim_cands = apt_rep + [c for c in ['ELEVATORS_AVG', 'LIVINGAREA_AVG', 'TOTALAREA_MODE'] if c in house_keep]
+cross_dim_iv = metric_passed_stats[metric_passed_stats['Row'].isin(cross_dim_cands)].sort_values(by='iv', ascending=False)
+if len(cross_dim_iv) > 0:
+    cross_dim_drops = cross_dim_iv.iloc[1:]['Row'].tolist()
+    house_redundant_drops.extend(cross_dim_drops)
+
+cols_after_house = [c for c in passed_cols if c not in house_redundant_drops]
+del house_df, house_keep, house_suffix_drops, house_redundant_drops
+
+# (5) 全局贪心共线性消除算法 (Greedy Collinearity Elimination, |r| > 0.80)
+num_passed = train_df[cols_after_house].select_dtypes(include='number').columns.tolist()
+cat_passed = [c for c in cols_after_house if c not in num_passed]
+
+num_stats = metric_passed_stats[metric_passed_stats['Row'].isin(num_passed)].sort_values(by='iv', ascending=False)
+sorted_num_cols = num_stats['Row'].tolist()
+
+spearman_corr = train_df[sorted_num_cols].corr(method='spearman')
+
+CORR_THRESHOLD = 0.80
+kept_num_cols = []
+for col in sorted_num_cols:
+    is_collinear = False
+    for kept in kept_num_cols:
+        r = spearman_corr.loc[col, kept]
+        if abs(r) > CORR_THRESHOLD:
+            is_collinear = True
+            break
+    if not is_collinear:
+        kept_num_cols.append(col)
+
+candidate_model_feats = kept_num_cols + cat_passed
+print(f"✓ 贪心共线性剔除 (|r| > 0.80): 产生 {len(candidate_model_feats)} 个入模候选特征")
+
+del spearman_corr, num_stats, sorted_num_cols, num_passed, cat_passed, cols_after_house, metric_passed_stats
+
+# %%
+# =============================================================================
+# 3. 精细约束分箱（OptBinning）
+# =============================================================================
+features = candidate_model_feats.copy()
+num_features = train_df[features].select_dtypes(include='number').columns.tolist()
+cat_features = [c for c in features if c not in num_features]
+
+# 针对典型非线性关系特征放宽至单峰或单谷 (U型)，限制 4 箱以内
 u_shape_cols = [c for c in ["AMT_GOODS_PRICE", "ANNUITY_TO_CREDIT_RATIO", "GOODS_TO_CREDIT_RATIO"] if c in num_features]
 
-# min_bin_n_event=30：落实注释中“每个分箱坏样本数不少于 20~30 个”的约束
-binning_fit_params = {}
+fine_binning_fit_params = {}
 for col in num_features:
     if col in u_shape_cols:
-        binning_fit_params[col] = {
-            "monotonic_trend": "auto",            # 允许 1 个合理峰值/谷值拐点
+        fine_binning_fit_params[col] = {
+            "monotonic_trend": "auto",            # 允许 1 个峰值/谷值拐点
             "max_n_bins": 4,                      # 限制 4 箱以内，防多拐点锯齿
             "min_bin_n_event": 30,                # 单箱至少 30 个坏样本
         }
     else:
-        binning_fit_params[col] = {
+        fine_binning_fit_params[col] = {
             "monotonic_trend": "auto_asc_desc",   # 严格单调递增或递减
             "min_bin_n_event": 30,
         }
 
 for col in cat_features:
-    binning_fit_params[col] = {
+    fine_binning_fit_params[col] = {
         "min_bin_n_event": 30,
     }
 
 del u_shape_cols
 
-# 实例化精细分箱器并在开发训练集上 fit
+# 实例化精细分箱器并在训练集上拟合
+print("正在执行精细约束分箱 (OptBinning)...")
 fine_binning_process = BinningProcess(
     variable_names=features,
     categorical_variables=cat_features,
-    max_n_prebins=30,                             # 预分箱数提升至 30，提高切点精度
-    min_prebin_size=0.02,                         # 预分箱最小占比 2% (需小于 min_bin_size)
+    max_n_prebins=30,
+    min_prebin_size=0.02,
     min_n_bins=2,
     max_n_bins=5,
     min_bin_size=0.05,
     max_pvalue=0.05,
     max_pvalue_policy="consecutive",
-    binning_fit_params=binning_fit_params,
+    binning_fit_params=fine_binning_fit_params,
     selection_criteria=None,
     n_jobs=-1
 )
-
-fine_binning_process.fit(X_train, y_train)
+fine_binning_process.fit(train_df[features], y_train)
 
 binning_summary = fine_binning_process.summary().rename(columns={'name': 'feature'})
 
-# 提取 WOE 编码数据集（供共线性检验与逐步回归使用）
+# 提取 WOE 编码数据集（供后续共线性排查与逐步回归使用）
 X_train_woe = pd.DataFrame(
-    fine_binning_process.transform(X_train, metric="woe", metric_missing="empirical"),
+    fine_binning_process.transform(train_df[features], metric="woe", metric_missing="empirical"),
     columns=features,
-    index=X_train.index
+    index=train_df.index
 )
 
-# 剔除极低覆盖度且分布极度倾斜的两箱房屋离散类别（如存在）
+# 剔除极低覆盖度且分布极度倾斜的房屋类别
 drop_initial_cat = [c for c in ['HOUSETYPE_MODE', 'EMERGENCYSTATE_MODE'] if c in X_train_woe.columns]
 if drop_initial_cat:
     X_train_woe = X_train_woe.drop(columns=drop_initial_cat)
@@ -268,30 +245,28 @@ del drop_initial_cat
 
 # %%
 # =============================================================================
-# 3. 多变量筛选（相关性、VIF、逐步回归与系数合理性检验）
+# 4. 多变量共线性排查、逐步回归与系数合理性校验
 # =============================================================================
-# optbinning woe 定义为 ln(good%/bad%)，好客户占比越高，WOE 越大
-# 预测目标为违约概率 P(Y=1) 时，正常入模特征的逻辑回归系数必须为负，正系数代表共线性反转，必须剔除
-
-# -- WOE 相关性筛选 (|r| >= 0.80) --
+print("正在执行 WOE 相关性过滤、VIF 诊断与逐步回归...")
+# -- (1) WOE 相关性筛选 (|r| >= 0.80) --
 train_woe_corr = X_train_woe.corr()
-result = train_woe_corr.stack().reset_index()
-result.columns = ['val1', 'val2', 'corr']
-result = result[np.abs(result['corr']).between(0.8, 1, inclusive='left')]
+corr_pairs = train_woe_corr.stack().reset_index()
+corr_pairs.columns = ['val1', 'val2', 'corr']
+corr_pairs = corr_pairs[np.abs(corr_pairs['corr']).between(0.8, 1, inclusive='left')]
 del train_woe_corr
 
-# 保留 IV 值更大的特征，剔除共线低 IV 特征
-iv_dict = dict(zip(binning_summary['feature'], binning_summary['iv']))
-result['iv1'] = result['val1'].map(iv_dict)
-result['iv2'] = result['val2'].map(iv_dict)
+iv_dict_fine = dict(zip(binning_summary['feature'], binning_summary['iv']))
+corr_pairs['iv1'] = corr_pairs['val1'].map(iv_dict_fine)
+corr_pairs['iv2'] = corr_pairs['val2'].map(iv_dict_fine)
 
-delete_corr_feature = list(set(result.loc[result['iv1'] < result['iv2'], 'val1'].tolist()))
-del binning_summary, iv_dict, result
+delete_corr_feature = list(set(corr_pairs.loc[corr_pairs['iv1'] < corr_pairs['iv2'], 'val1'].tolist()))
+del binning_summary, iv_dict_fine, corr_pairs
 
 features = [col for col in features if col not in delete_corr_feature]
 X_train_woe = X_train_woe.drop(columns=delete_corr_feature)
+del delete_corr_feature
 
-# -- VIF 多重共线性迭代剔除 (阈值: VIF <= 5) --
+# -- (2) 常数截距 VIF 迭代剔除 (阈值: VIF <= 5.0) --
 while True:
     X_with_const = sm.add_constant(X_train_woe)
     vif = pd.Series(
@@ -308,7 +283,9 @@ while True:
         del vif
         break
 
-# -- 逐步回归筛选特征 (AIC 准则) --
+print(f"✓ VIF 诊断完成 (全部特征 VIF <= 5.0)，剩余特征数: {len(features)}")
+
+# -- (3) 双向逐步回归 (AIC 准则) --
 stepwise_df = toad.selection.stepwise(
     X_train_woe.join(y_train),
     target='TARGET',
@@ -319,8 +296,9 @@ stepwise_df = toad.selection.stepwise(
 final_model_feats = [col for col in stepwise_df.columns if col != "TARGET"]
 del features, stepwise_df
 
-# -- 检查入模特征逻辑回归系数是否反转 (大于 0) --
-# 在当前入模候选集合上拟合逻辑回归，迭代剔除系数大于 0（符号反转）的特征，直到所有系数均为负
+# -- (4) 逻辑回归系数符号检验与反转剔除 --
+# optbinning WOE 定义为 ln(good%/bad%)，好客户占比越高，WOE 越大
+# 预测目标为违约概率时，正常逻辑回归系数必须为负；正系数代表共线性反转，必须剔除避免风险倒挂
 while True:
     logit_mod = sm.Logit(y_train, sm.add_constant(X_train_woe[final_model_feats])).fit(disp=False)
     coefs = logit_mod.params.drop('const')
@@ -328,6 +306,7 @@ while True:
     del logit_mod
     if len(pos_coefs) > 0:
         worst_feature = pos_coefs.idxmax()
+        print(f"  ⚠️ 发现符号反转变量 (系数为正): {worst_feature}，予以剔除以防风险倒挂")
         final_model_feats.remove(worst_feature)
     else:
         del coefs, pos_coefs
@@ -336,14 +315,15 @@ while True:
 del X_train_woe
 gc.collect()
 
-num_final_feats = [c for c in final_model_feats if c in num_features]
-cat_final_feats = [c for c in final_model_feats if c in cat_features]
+print(f"✓ 逐步回归与符号校验完成！最终入模特征数: {len(final_model_feats)}")
 
 # %%
 # =============================================================================
-# 4. 训练标准评分卡并映射 PDO 刻度
+# 5. 训练标准信用评分卡与 PDO 刻度映射
 # =============================================================================
-# 为最终入模特征专门构建 BinningProcess
+num_final_feats = [c for c in final_model_feats if c in num_features]
+cat_final_feats = [c for c in final_model_feats if c in cat_features]
+
 scorecard_bp = BinningProcess(
     variable_names=final_model_feats,
     categorical_variables=cat_final_feats,
@@ -354,15 +334,11 @@ scorecard_bp = BinningProcess(
     min_bin_size=0.05,
     max_pvalue=0.05,
     max_pvalue_policy="consecutive",
-    binning_fit_params={c: binning_fit_params[c] for c in final_model_feats},
+    binning_fit_params={c: fine_binning_fit_params[c] for c in final_model_feats},
     selection_criteria=None,
     n_jobs=-1
 )
 
-# 设置标准评分卡刻度参数：
-# - scaling_method="pdo_odds"
-# - pdo=20：好坏比 (Odds) 每翻一倍，分数增加 20 分
-# - scorecard_points=600：基准分 600 分
 base_odds = (1 - y_train.mean()) / y_train.mean()
 
 lr_estimator = LogisticRegression(
@@ -382,61 +358,62 @@ scorecard = Scorecard(
         "odds": base_odds,
         "scorecard_points": 600
     },
-    rounding=True        # 每个分箱得分四舍五入为整数，便于线上部署
+    rounding=True        # 每个分箱得分四舍五入为整数，便于生产规则部署
 )
 
-del base_odds, lr_estimator, scorecard_bp, binning_fit_params
+del base_odds, lr_estimator, scorecard_bp, fine_binning_fit_params
 
-# Scorecard.fit 接收开发训练集的入模特征原始值
-scorecard.fit(X_train[final_model_feats], y_train)
+# Scorecard.fit 接收训练集的原始特征值
+print("正在拟合标准评分卡并执行 PDO=20, 600 基准分刻度映射...")
+scorecard.fit(train_df[final_model_feats], y_train)
 
-# 导出标准评分卡各分箱加减分明细表至 outputs/models
+# 导出标准评分卡明细表
 scorecard_table = scorecard.table(style="detailed")
 scorecard_table.to_csv(MODEL_OUTPUT_PATH / 'final_scorecard_table.csv', index=False)
+print(f"✓ 标准评分卡明细表已导出至: {MODEL_OUTPUT_PATH / 'final_scorecard_table.csv'}")
 
 # %%
 # =============================================================================
-# 5. 模型综合评估（AUC、KS 与 PSI，严格按照 00_stratified_split.py 规定分工）
+# 6. 模型效果综合评估（AUC、KS 与跨客群总分 PSI）
 # =============================================================================
-# 预测违约概率 (用于算 AUC / KS) 与 信用评分 (用于算跨客群总分 PSI)
-train_prob = scorecard.predict_proba(X_train[final_model_feats])[:, 1]
-valid_prob = scorecard.predict_proba(X_valid[final_model_feats])[:, 1]
+print("正在进行验证集评估与测试集总分 PSI 检验...")
+train_prob = scorecard.predict_proba(train_df[final_model_feats])[:, 1]
+valid_prob = scorecard.predict_proba(valid_df[final_model_feats])[:, 1]
 
-train_score = scorecard.score(X_train[final_model_feats])
-test_score = scorecard.score(X_test[final_model_feats])
-
+train_score = scorecard.score(train_df[final_model_feats])
+test_score = scorecard.score(test_df[final_model_feats])
 
 def calc_ks(y_true, y_prob):
     """计算 KS (Kolmogorov-Smirnov) 统计量"""
     fpr, tpr, _ = roc_curve(y_true, y_prob)
     return np.max(np.abs(tpr - fpr))
 
-
-# (1) AUC 与 KS 评估：开发训练集 (Train Dev) vs 独立闭卷验证集 (Valid Blind)
 train_auc = roc_auc_score(y_train, train_prob)
 valid_auc = roc_auc_score(y_valid, valid_prob)
 
 train_ks = calc_ks(y_train, train_prob)
 valid_ks = calc_ks(y_valid, valid_prob)
 
-# (2) 官方测试集跨客群模型总分 PSI 评估：使用 toad 的 Combiner 在开发集总分上拟合 10 等频分箱切点
+# 测试集总分 PSI 评估 (基于训练集总分等频分箱切点)
 score_combiner = toad.transform.Combiner()
 score_combiner.fit(pd.Series(train_score, name='score'), method='quantile', n_bins=10)
-
-# 官方未标注测试集跨客群总分 PSI（根据 00_stratified_split.py 说明，评估面对未知分布时的跨客群稳定性）
 test_score_psi = toad.metrics.PSI(train_score, test_score, combiner=score_combiner)
 
-# 汇总评估指标并落盘
+# 汇总并保存评估报告
 eval_summary_df = pd.DataFrame({
-    '数据集': ['开发训练集 (Train Dev)', '闭卷验证集 (Valid Blind)', '官方测试集 (Official Test)'],
-    '样本量': [len(X_train), len(X_valid), len(X_test)],
+    '数据集': ['训练集 (Train)', '验证集 (Valid)', '测试集 (Test)'],
+    '样本量': [len(train_df), len(valid_df), len(test_df)],
     'AUC': [f"{train_auc:.4f}", f"{valid_auc:.4f}", "-"],
     'KS': [f"{train_ks:.4f}", f"{valid_ks:.4f}", "-"],
     '跨客群总分 PSI': ["基准 (0.00000)", "-", f"{test_score_psi:.5f}"]
 })
 eval_summary_df.to_csv(MODEL_OUTPUT_PATH / 'scorecard_eval_summary.csv', index=False)
 
-#                      数据集     样本量     AUC      KS     跨客群总分 PSI
-# 0      开发训练集 (Train Dev)  246008  0.7517  0.3749  基准 (0.00000)
-# 1    闭卷验证集 (Valid Blind)   61503  0.7470  0.3681             -
-# 2  官方测试集 (Official Test)   48744       -       -       0.00157
+print("\n" + "=" * 70)
+print("✓ [标准信用评分卡建模与评估完成 - 汇总账本]")
+print(eval_summary_df.to_string(index=False))
+print("=" * 70)
+
+del train_df, valid_df, test_df, y_train, y_valid, train_prob, valid_prob, train_score, test_score
+del scorecard, score_combiner, eval_summary_df, scorecard_table
+gc.collect()

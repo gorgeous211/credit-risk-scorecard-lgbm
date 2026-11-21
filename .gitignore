@@ -1,16 +1,97 @@
-# Python 缓存与构建产物
-__pycache__/
+# ==========================================
+# 论文与写作材料 (Paper & Research Materials)
+# ==========================================
+paper/
 
-# 编辑器与操作系统文件
-.vscode/
-
-# 日志与临时文件
-*.log
-*.tmp
-*.swp
-
-# 数据集文件（大文件不入版本库）
+# ==========================================
+# 数据集文件 (Datasets - 大文件不入库)
+# ==========================================
 /data/raw/*
 !/data/raw/HomeCredit_columns_description.csv
 /data/interim/
 /data/processed/
+
+# 常见大体积数据格式（防止本地临时数据误提交）
+*.parquet
+*.feather
+*.zip
+*.tar.gz
+*.7z
+
+# ==========================================
+# 模型二进制权重 (Model Artifacts - 保留评估CSV)
+# ==========================================
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.pth
+*.pt
+*.bin
+*.onnx
+
+# ==========================================
+# Python 虚拟环境与包管理 (Environments & Packaging)
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# Python 字节码与缓存 (Bytecode & Caches)
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# Jupyter Notebook 临时文件
+# ==========================================
+.ipynb_checkpoints/
+
+# ==========================================
+# 编辑器与 IDE (IDEs & Editors)
+# ==========================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ==========================================
+# 操作系统生成文件 (Operating System)
+# ==========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ==========================================
+# 日志、临时与敏感信息 (Logs, Temps & Secrets)
+# ==========================================
+*.log
+*.tmp
+*.swp
+*.fault
+diag_result.txt
+*~
+.env
+.env.local
+.env.*.local
+!.env.example

@@ -1,6 +1,6 @@
 # %%
 # =============================================================================
-# 数据预处理：样本分层切分与验证集独立封存
+# 数据预处理：原始训练集分层切分（训练集与验证集）
 # =============================================================================
 # 一、背景与设计目的
 # 为避免数据穿越（Data Leakage）与数据窥探（Data Snooping）：
@@ -8,24 +8,24 @@
 # 或利用全量标签计算 IV/WOE 筛选特征，验证集信息就会提前渗入建模流程，
 # 导致本地评估的 AUC 和 KS 产生乐观偏差，无法客观反映未见样本上的表现。
 #
-# 因此，在开展任何探索性分析（EDA）与特征工程前，先将原始数据做物理隔离。
+# 因此，在开展任何探索性分析（EDA）与特征工程前，先将原始训练集做物理隔离。
 #
 # 二、为什么采用分层抽样（Stratified Sampling）
 # 申请主表违约样本仅占约 8.07%，属于典型的不平衡分类场景。
 # 普通随机抽样容易因抽样波动导致验证集的坏样本比例产生偏差，
 # 进而影响基准好坏比（Base Odds）与违约概率的标定。
-# 采用分层抽样能使开发集与验证集的先验违约率严格一致。
+# 采用分层抽样能使切分后的训练集与验证集的先验违约率严格一致。
 #
 # 三、数据集划分与分工
-# 1. 开发训练集（Train Dev, 80%）：
+# 1. 训练集（Train, 80%）：
 #    用于后续的 EDA 探索、缺失值与异常值规则定义、分箱拟合（fit）、
 #    IV 计算与特征筛选、模型训练及内部交叉验证。
-# 2. 闭卷验证集（Valid Blind, 20%）：
-#    在建模完成前完全独立封存，不参与任何规则拟合；
+# 2. 验证集（Valid, 20%）：
+#    独立切分封存，不参与任何规则拟合；
 #    模型训练完成后仅执行映射（transform）与推理，用于独立评估 AUC 与 KS。
-# 3. 官方未标注测试集（Official Test, 4.8 万条）：
-#    无 TARGET 标签，直接输入训练好的模型输出预测分值，
-#    用于评估跨客群模型总分 PSI，检验模型面对未知分布时的稳定性。
+# 3. 测试集（Test, 4.8 万条）：
+#    对应未标注测试集（application_test.csv），无 TARGET 标签，
+#    输入训练好的模型输出预测分值/概率，用于跨客群稳定性（PSI）评估。
 # =============================================================================
 
 # %%
@@ -49,8 +49,8 @@ VALIDATION_OUTPUT_PATH = OUTPUTS_PATH / "validation"
 
 # 数据文件路径
 RAW_TRAIN_PATH = RAW_DATA_PATH / "application_train.csv"
-TRAIN_DEV_PATH = INTERIM_DATA_PATH / "application_train_dev.csv"
-VALID_BLIND_PATH = INTERIM_DATA_PATH / "application_valid_blind.csv"
+TRAIN_PATH = INTERIM_DATA_PATH / "application_train_split.csv"
+VALID_PATH = INTERIM_DATA_PATH / "application_valid.csv"
 SPLIT_AUDIT_PATH = VALIDATION_OUTPUT_PATH / "split_audit.csv"
 
 # %%
@@ -96,14 +96,14 @@ del unique_targets
 # 2. 执行分层抽样切分
 # =============================================================================
 # 参数设计考量：
-# - test_size = 0.20：按 8:2 划分，开发集保留约 24.6 万条样本以学习细分特征，
+# - test_size = 0.20：按 8:2 划分，训练集保留约 24.6 万条样本以学习细分特征，
 #   验证集保留约 4,965 个违约样本，保证 KS 与 AUC 评估的统计稳定性。
 # - random_state = 123：固定随机种子，保证切分结果可复现。
 # - shuffle = True：切分前打乱样本顺序，消除可能的物理存储序列关联。
 # - stratify = raw_train['TARGET']：按标签比例分层抽样，保持两份数据坏账率一致。
 # =============================================================================
 
-train_dev, valid_blind = train_test_split(
+train, valid = train_test_split(
     raw_train,
     test_size=0.20,
     random_state=123,
@@ -111,31 +111,31 @@ train_dev, valid_blind = train_test_split(
     stratify=raw_train['TARGET']
 )
 
-train_dev = train_dev.reset_index(drop=True)
-valid_blind = valid_blind.reset_index(drop=True)
+train = train.reset_index(drop=True)
+valid = valid.reset_index(drop=True)
 
 # %%
 # =============================================================================
 # 3. 切分结果核验与质量审计
 # =============================================================================
 # 1. 验证两份数据无重叠主键
-train_ids = set(train_dev['SK_ID_CURR'])
-valid_ids = set(valid_blind['SK_ID_CURR'])
+train_ids = set(train['SK_ID_CURR'])
+valid_ids = set(valid['SK_ID_CURR'])
 intersection_ids = train_ids.intersection(valid_ids)
 
 len(intersection_ids) == 0
 # 训练集与验证集无样本重叠
 
 # 2. 核对坏账率是否一致
-train_bad_rate = train_dev['TARGET'].mean()
-valid_bad_rate = valid_blind['TARGET'].mean()
+train_bad_rate = train['TARGET'].mean()
+valid_bad_rate = valid['TARGET'].mean()
 
 split_audit_df = pd.DataFrame({
-    '数据集': ['原始训练表 (Raw)', '开发训练集 (Train Dev)', '闭卷验证集 (Valid Blind)'],
-    '样本量': [len(raw_train), len(train_dev), len(valid_blind)],
-    '样本占比': ['100.00%', f"{len(train_dev)/len(raw_train):.2%}", f"{len(valid_blind)/len(raw_train):.2%}"],
-    '正常客户(0)': [overall_good_count, int((train_dev['TARGET'] == 0).sum()), int((valid_blind['TARGET'] == 0).sum())],
-    '违约客户(1)': [overall_bad_count, int((train_dev['TARGET'] == 1).sum()), int((valid_blind['TARGET'] == 1).sum())],
+    '数据集': ['原始训练集 (Raw Train)', '训练集 (Train)', '验证集 (Valid)'],
+    '样本量': [len(raw_train), len(train), len(valid)],
+    '样本占比': ['100.00%', f"{len(train)/len(raw_train):.2%}", f"{len(valid)/len(raw_train):.2%}"],
+    '正常客户(0)': [overall_good_count, int((train['TARGET'] == 0).sum()), int((valid['TARGET'] == 0).sum())],
+    '违约客户(1)': [overall_bad_count, int((train['TARGET'] == 1).sum()), int((valid['TARGET'] == 1).sum())],
     '坏账率': [f"{overall_bad_rate:.4%}", f"{train_bad_rate:.4%}", f"{valid_bad_rate:.4%}"]
 })
 
@@ -156,16 +156,16 @@ gc.collect()
 # 4. 数据文件落盘
 # =============================================================================
 # 输出约定：
-# 1. application_train_dev.csv：
-#    作为 01_eda.py、03_feature_engineering.py、04_scorecard_modeling.py
-#    和 05_lightgbm_modeling.py 的唯一开发输入。
-# 2. application_valid_blind.csv：
-#    作为模型完成训练后的独立验证集，仅执行无监督映射与评分评估。
+# 1. application_train_split.csv (80% 训练集)：
+#    保存在 data/interim/，作为 01_eda.py、03_feature_engineering.py、04_scorecard_modeling.py
+#    和 05_lightgbm_modeling.py 的训练输入。
+# 2. application_valid.csv (20% 验证集)：
+#    保存在 data/interim/，作为模型完成训练后的独立验证集，仅执行无监督映射与评分评估。
 # =============================================================================
 # 导出训练集与验证集
-train_dev.to_csv(TRAIN_DEV_PATH, index=False)
-valid_blind.to_csv(VALID_BLIND_PATH, index=False)
+train.to_csv(TRAIN_PATH, index=False)
+valid.to_csv(VALID_PATH, index=False)
 
 # 清理落盘中间变量与数据集，释放内存
-del train_dev, valid_blind
+del train, valid
 gc.collect()

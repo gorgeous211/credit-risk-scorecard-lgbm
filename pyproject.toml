@@ -1,0 +1,19 @@
+[project]
+name = "home-credit-default-risk"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=6.31.0",
+    "lightgbm>=4.7.0",
+    "numpy>=2.5.5",
+    "optbinning>=1.0.0",
+    "optuna>=5.1.0",
+    "pandas>=3.1.1",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "spyder-kernels>=3.1.7",
+    "statsmodels>=0.15.0",
+    "toad>=0.1.7",
+]
