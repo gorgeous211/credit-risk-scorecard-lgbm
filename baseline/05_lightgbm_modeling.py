@@ -1,17 +1,15 @@
 # %%
 # =============================================================================
 # LightGBM 梯度提升决策树建模与评估
-# (LightGBM Modeling, Gain Selection & Optuna Hyperparameter Optimization)
+# (LightGBM Modeling, Gain Selection & Optuna Optimization)
 # =============================================================================
-# 核心架构定位：
-# 本脚本实现【机器学习提升树（LightGBM）】建模。
-# 直接从统一特征工程输出（data/processed/train_features_full.csv）读取全量候选特征，
-# 执行专属于 GBDT 集成树模型的端到端建模流程：
-# 1. 类别特征与连续特征自适应适配（保留连续数值形态，保留高缺失分支，类别原生 category 支持）；
-# 2. 树模型专属粗筛（同值率 > 95% 过滤，Spearman |r| >= 0.95 宽容度去共线）；
-# 3. 5 折分层交叉验证 OOF 与累计分裂增益精选（Gain Importance 累计前 95% 核心特征）；
-# 4. Optuna TPE 贝叶斯搜索优化浅树深度、叶子数与 L1/L2 正则化超参数；
-# 5. 5 折模型集成推理（训练集 OOF 泛化评估、验证集独立评估、测试集概率 PSI 稳定性验证）。
+# 模块功能：
+# 实现基于 LightGBM 的 GBDT 提升树建模流程：
+# 1. 特征类型适配（保留连续值与缺失分支，类别特征转为 category 原生支持）；
+# 2. 特征初筛（同值率 > 95% 过滤，Spearman |r| >= 0.95 宽容度去共线）；
+# 3. 5 折交叉验证 OOF 计算分裂增益，保留累计增益前 95% 的特征；
+# 4. Optuna 贝叶斯超参数调优（优化树深度、叶子数与 L1/L2 正则项）；
+# 5. 5 折模型集成与评估（训练集 OOF、验证集评估及测试集预测概率 PSI）。
 # =============================================================================
 
 # %%
@@ -48,7 +46,7 @@ y_valid = valid['TARGET'].copy()
 ignore_cols = ['SK_ID_CURR', 'TARGET']
 all_feature_cols = [c for c in train.columns if c not in ignore_cols]
 
-# 统一类别特征类型（对齐 category 分类维度，供 LightGBM 原生支持）
+# 统一类别特征为 category 类型，适配 LightGBM 原生接口
 cat_cols = train[all_feature_cols].select_dtypes(exclude='number').columns.tolist()
 for col in cat_cols:
     train[col] = train[col].astype('category')
@@ -60,7 +58,7 @@ print(f"初始候选特征数: {len(all_feature_cols)} (其中类别型: {len(ca
 
 # %%
 # =============================================================================
-# 2. 树模型专属特征粗筛（同值率 > 0.95 过滤，Spearman 宽阈值去共线）
+# 2. 特征初筛（同值率 > 0.95 过滤，Spearman 宽阈值去共线）
 # =============================================================================
 # (1) 剔除极高同值特征（同值率 > 0.95）
 primary_value_ratios = pd.Series({
@@ -69,7 +67,7 @@ primary_value_ratios = pd.Series({
 })
 high_pvr_cols = primary_value_ratios[primary_value_ratios > 0.95].index.tolist()
 
-# (2) 多重共线性：对数值特征采用 Spearman 相关系数，宽阈值设置为 0.95 (树模型抗共线性强)
+# (2) 相关性初筛：Spearman 阈值设为 0.95（树模型抗共线性较强，仅剔除极高度相关变量）
 orig_num_cols = [c for c in all_feature_cols if c not in cat_cols and c not in high_pvr_cols]
 features_corr = train[orig_num_cols].corr(method='spearman')
 
@@ -98,7 +96,7 @@ gc.collect()
 
 # %%
 # =============================================================================
-# 3. 5 折分层交叉验证 OOF 与累计分裂增益精选 (Gain Importance Top 95%)
+# 3. 5 折交叉验证与累计分裂增益筛选 (Gain Importance Top 95%)
 # =============================================================================
 X = train[candidate_feature_cols]
 y = y_train
@@ -166,14 +164,14 @@ gc.collect()
 
 # %%
 # =============================================================================
-# 4. Optuna TPE 贝叶斯超参数优化（浅树与强正则搜索）
+# 4. Optuna 贝叶斯超参数优化（树结构与正则化参数调优）
 # =============================================================================
 X_final = train[selected_feature_cols].copy()
 
 def objective(trial):
     max_depth = trial.suggest_int('max_depth', 3, 5)
     num_leaves_raw = trial.suggest_int('num_leaves', 4, 30)
-    # 严格确保 num_leaves 小于 2^max_depth - 1，防止满分裂过拟合
+    # 限制 num_leaves 小于 2^max_depth - 1，避免满二叉树过拟合
     num_leaves = min(num_leaves_raw, (2 ** max_depth) - 2)
     
     subsample = trial.suggest_categorical('subsample', [0.8, 0.9, 1.0])
@@ -235,7 +233,7 @@ gc.collect()
 
 # %%
 # =============================================================================
-# 5. 最优参数 5 折完整集成训练与验证集/测试集推理
+# 5. 最优超参数 5 折集成训练与推理
 # =============================================================================
 final_params = {
     'objective': 'binary',
@@ -299,7 +297,7 @@ cv_ks = calc_ks(y, oof_preds)
 valid_auc = roc_auc_score(y_valid, valid_preds)
 valid_ks = calc_ks(y_valid, valid_preds)
 
-# (3) 测试集跨客群 PSI 稳定性评估 (以训练集 OOF 概率分布作为基准分箱)
+# (3) 测试集跨客群 PSI 评估 (以训练集 OOF 预测概率为基准分箱)
 prob_combiner = toad.transform.Combiner()
 prob_combiner.fit(pd.Series(oof_preds, name='prob'), method='quantile', n_bins=10)
 test_psi = toad.metrics.PSI(oof_preds, test_preds, combiner=prob_combiner)

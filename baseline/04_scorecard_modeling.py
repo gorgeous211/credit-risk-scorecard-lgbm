@@ -1,20 +1,18 @@
 # %%
 # =============================================================================
 # 逻辑回归标准信用评分卡建模与评估
-# (Scorecard Modeling & Multi-Stage Screening Pipeline)
+# (Scorecard Modeling & Screening Pipeline)
 # =============================================================================
-# 核心架构定位：
-# 本脚本实现【传统统计评分卡（Logistic Regression）】建模。
-# 直接从统一特征工程输出（data/processed/train_features_full.csv）读取全量候选特征，
-# 执行专属于标准评分卡的端到端漏斗筛选与建模：
-# 1. 学历有序类别映射（强制单调性）；
-# 2. 数据质量与判别力粗筛（同值率 > 95%、缺失率 > 90% 剔除，IV >= 0.02 准入）；
-# 3. 房屋同源去重与贪心共线性消除（Spearman |r| >= 0.80，保留高 IV 者）；
-# 4. OptBinning 精细约束分箱（单箱占比 >= 5%，坏样本 >= 30，严格单调与比率 U 型放宽）；
-# 5. WOE 编码与多变量共线性排查（WOE 相关性过滤、常数截距 VIF <= 5 诊断）；
-# 6. 双向逐步回归（AIC 准则）与回归系数符号反转校验（严防风险与评分倒挂）；
-# 7. PDO 刻度映射（基准分 600 分，PDO = 20，Odds = 11.39，输出整数加减分明细表）；
-# 8. 独立验证集（AUC / KS）评估与测试集总分 PSI 跨客群稳定性验证。
+# 模块功能：
+# 实现基于逻辑回归的标准信用评分卡建模流程：
+# 1. 学历有序类别数值编码；
+# 2. 数据质量粗筛（剔除同值率 > 95% 或缺失率 > 90% 的字段，IV >= 0.02 准入）；
+# 3. 房屋同源特征去重与相关性初筛（Spearman |r| >= 0.80，保留高 IV 特征）；
+# 4. OptBinning 分箱（单箱占比 >= 5%，坏样本 >= 30，单调性约束）；
+# 5. WOE 编码与多变量共线性排查（相关性过滤、VIF <= 5 迭代剔除）；
+# 6. 双向逐步回归（AIC 准则）与系数符号合理性检验（排除符号反转特征）；
+# 7. PDO 刻度映射（基准分 600 分，PDO = 20，输出整数加减分明细）；
+# 8. 独立验证集评估（AUC、KS）与测试集总分跨客群稳定性评估（PSI）。
 # =============================================================================
 
 # %%
@@ -51,7 +49,7 @@ test_df = pd.read_csv(PROCESSED_DATA_PATH / 'test_features_full.csv')
 y_train = train_df['TARGET'].copy()
 y_valid = valid_df['TARGET'].copy()
 
-# 学历有序类别映射（在特征筛选前完成数值单调化）
+# 学历有序类别数值编码（在特征筛选前完成单调化映射）
 edu_mapping = {
     'Lower secondary': 1,
     'Secondary / secondary special': 2,
@@ -77,7 +75,7 @@ del raw_features_summary
 
 # %%
 # =============================================================================
-# 2. 评分卡专属前置漏斗初筛（质量、IV、房屋去重与相关性）
+# 2. 评分卡特征漏斗初筛（质量、IV、房屋去重与相关性）
 # =============================================================================
 # (1) 数据质量粗筛：同值率 > 0.95 或 缺失率 > 0.90
 missing_rates = train_df[candidate_features].isna().mean()
@@ -93,11 +91,11 @@ quality_drop_cols = sorted(list(set(high_pvr_cols + high_missing_cols)))
 filtered_candidates = [c for c in candidate_features if c not in quality_drop_cols]
 print(f"✓ 质量初筛完成: 剔除极高同值/缺失字段 {len(quality_drop_cols)} 个，剩余 {len(filtered_candidates)} 个")
 
-# 严谨划分数值列与类别列 (兼容 pandas 2.0+ 与字符串类型)
+# 区分数值型特征与类别型特征
 num_filtered = train_df[filtered_candidates].select_dtypes(include='number').columns.tolist()
 cat_filtered = [c for c in filtered_candidates if c not in num_filtered]
 
-# (2) 批量最优分箱快速拟合计算 IV（仅在训练集 train_df 上 fit）
+# (2) 批量最优分箱计算特征 IV（仅在训练集上拟合）
 binning_fit_params = {
     col: {"monotonic_trend": "auto", "cat_cutoff": 0.05}
     for col in filtered_candidates
@@ -129,7 +127,7 @@ metric_passed_stats = metric_passed_stats[metric_passed_stats['iv'] >= 0.02].sor
 passed_cols = metric_passed_stats['Row'].tolist()
 print(f"✓ IV 阈值准入 (IV >= 0.02): 保留特征 {len(passed_cols)} 个")
 
-# (4) 房屋标准化特征同源后缀去重与跨维度面积共线消除
+# (4) 房屋特征同源后缀去重与强相关面积字段去共线
 passed_house_cols = [c for c in passed_cols if c in house_cols and c in num_filtered]
 house_redundant_drops = []
 house_df = metric_passed_stats[metric_passed_stats['Row'].isin(passed_house_cols)].copy()
@@ -150,7 +148,7 @@ if len(cross_dim_iv) > 0:
 cols_after_house = [c for c in passed_cols if c not in house_redundant_drops]
 del house_df, house_keep, house_suffix_drops, house_redundant_drops
 
-# (5) 全局贪心共线性消除算法 (Greedy Collinearity Elimination, |r| > 0.80)
+# (5) 贪心相关性过滤 (|r| > 0.80，优先保留高 IV 特征)
 num_passed = train_df[cols_after_house].select_dtypes(include='number').columns.tolist()
 cat_passed = [c for c in cols_after_house if c not in num_passed]
 
@@ -178,13 +176,13 @@ del spearman_corr, num_stats, sorted_num_cols, num_passed, cat_passed, cols_afte
 
 # %%
 # =============================================================================
-# 3. 精细约束分箱（OptBinning）
+# 3. 约束分箱（OptBinning）
 # =============================================================================
 features = candidate_model_feats.copy()
 num_features = train_df[features].select_dtypes(include='number').columns.tolist()
 cat_features = [c for c in features if c not in num_features]
 
-# 针对典型非线性关系特征放宽至单峰或单谷 (U型)，限制 4 箱以内
+# 部分非线性比率特征放宽单调性限制（允许单峰/单谷），最多 4 箱
 u_shape_cols = [c for c in ["AMT_GOODS_PRICE", "ANNUITY_TO_CREDIT_RATIO", "GOODS_TO_CREDIT_RATIO"] if c in num_features]
 
 fine_binning_fit_params = {}
@@ -296,9 +294,9 @@ stepwise_df = toad.selection.stepwise(
 final_model_feats = [col for col in stepwise_df.columns if col != "TARGET"]
 del features, stepwise_df
 
-# -- (4) 逻辑回归系数符号检验与反转剔除 --
-# optbinning WOE 定义为 ln(good%/bad%)，好客户占比越高，WOE 越大
-# 预测目标为违约概率时，正常逻辑回归系数必须为负；正系数代表共线性反转，必须剔除避免风险倒挂
+# -- (4) 逻辑回归系数符号合理性检验与反转剔除 --
+# optbinning 的 WOE 定义为 ln(good% / bad%)，好客户占比越高则 WOE 越大。
+# 预测目标为违约（TARGET=1）时，正常系数应为负；正系数表明存在共线性反转，需剔除以防风险方向倒挂。
 while True:
     logit_mod = sm.Logit(y_train, sm.add_constant(X_train_woe[final_model_feats])).fit(disp=False)
     coefs = logit_mod.params.drop('const')
@@ -342,7 +340,7 @@ scorecard_bp = BinningProcess(
 base_odds = (1 - y_train.mean()) / y_train.mean()
 
 lr_estimator = LogisticRegression(
-    penalty=None,        # 关闭正则化，保持标准线性 Logit 尺度
+    penalty=None,        # 不使用正则化，保持标准 Logit 参数估计
     solver='lbfgs',
     max_iter=1000,
     tol=1e-6,
@@ -358,7 +356,7 @@ scorecard = Scorecard(
         "odds": base_odds,
         "scorecard_points": 600
     },
-    rounding=True        # 每个分箱得分四舍五入为整数，便于生产规则部署
+    rounding=True        # 分箱得分四舍五入取整
 )
 
 del base_odds, lr_estimator, scorecard_bp, fine_binning_fit_params
@@ -394,7 +392,7 @@ valid_auc = roc_auc_score(y_valid, valid_prob)
 train_ks = calc_ks(y_train, train_prob)
 valid_ks = calc_ks(y_valid, valid_prob)
 
-# 测试集总分 PSI 评估 (基于训练集总分等频分箱切点)
+# 测试集总分 PSI 评估 (以训练集总分等频分箱为基准)
 score_combiner = toad.transform.Combiner()
 score_combiner.fit(pd.Series(train_score, name='score'), method='quantile', n_bins=10)
 test_score_psi = toad.metrics.PSI(train_score, test_score, combiner=score_combiner)

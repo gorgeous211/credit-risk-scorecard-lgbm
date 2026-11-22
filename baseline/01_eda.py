@@ -1,17 +1,12 @@
 # %%
 # =============================================================================
-# 探索性数据分析（EDA）：只基于训练集 Train
+# 探索性数据分析（EDA）：基于训练集 Train
 # =============================================================================
-# 数据隔离原则（详见 00_stratified_split.py）：
-# 1. 训练数据只读取 data/interim/application_train_split.csv，即 00 脚本按
-#    8:2 分层抽样得到的训练集；原始训练集切分出的验证集 application_valid.csv
-#    不参与 EDA，避免验证集信息渗入缺失率统计、分箱拟合、IV 计算、相关性筛选等
-#    任何规则拟合环节。
-# 2. 测试集 application_test.csv 没有 TARGET 标签，仅用于字段与
-#    类型对齐校验（Schema Check），不参与任何单变量统计与有监督拟合。
-# 3. 样本量、主键唯一性、训练集/验证集无重叠、坏账率一致性等切分校验
-#    已由 00_stratified_split.py 完成并落盘到
-#    outputs/validation/split_audit.csv，本脚本不再重复。
+# 数据隔离要求：
+# 1. 仅读取 data/interim/application_train_split.csv 进行 EDA；验证集
+#    application_valid.csv 不参与统计与规则拟合，避免信息泄露。
+# 2. 测试集 application_test.csv 仅用于字段和类型对齐校验，不参与单变量统计。
+# 3. 样本量、主键唯一性及切分质量审计已在 00_stratified_split.py 完成，此处不重复。
 # =============================================================================
 
 # 库
@@ -71,8 +66,8 @@ test.duplicated().any()
 
 # %%
 "二、数据质量与单变量概览（Data Quality & Univariate Profiling）"
-# 本节只进行字段质量、分布和缺失模式体检，不直接删除、填充或修正特征；
-# 是否清洗由后续特征工程阶段结合业务含义和验证集表现决定。
+# 本节仅统计字段质量与分布特征，不直接修改或剔除字段；
+# 具体清洗策略在后续特征工程中结合业务定义处理。
 
 # -- 数据类型与字段说明 --
 cols_train_types = train.dtypes.rename('dtypes')
@@ -95,7 +90,7 @@ numeric_feature_columns = train[feature_columns].select_dtypes(
 ).columns.tolist()
 
 # -- 形成单变量质量汇总：缺失率、最大同值率、分位数 --
-# 阈值只用于待审查清单：缺失率 >90%、最大同值率 >95% 优先复核；不能脱离业务含义直接删特征。
+# 筛查标准：缺失率 >90% 或同值率 >95% 列入复核清单，需结合业务含义决定是否保留。
 univariate_summary = pd.DataFrame(index=feature_columns)
 univariate_summary.index.name = 'Row'
 univariate_summary['missing_rate'] = train[feature_columns].isna().mean()
@@ -130,7 +125,7 @@ gc.collect()
 
 # 在 DAYS_EMPLOYED 中发现 365243 特殊编码
 # 分位数：p1=-10900, p5=-6744, p50=-1216, p95=365243, p99=365243
-# 说明：365243 不在正常工龄取值范围内；在特征工程中应转为缺失，并保留异常标记。
+# 说明：365243 为特殊标记值（约 1000 年），后续特征工程中需转为 NaN 并保留异常标记。
 
 # -- 缺失率分析 --
 missing_summary = train.isna().mean().reset_index()
@@ -201,21 +196,17 @@ for rate, group in missing_summary_nonzero.groupby('missing_rate'):
 
 # 没有输出结果
 
-" 相同缺失率的字段缺失模式都相同"
-" 每个缺失率相同的字段组内部，字段的缺失标记在每条样本上都完全一致 "
-" 也就是说，一条样本中组内字段要么全都有值，要么全缺失；不会出现组内某个字段缺失、另一个字段有值的情况 "
-
-" 这提示这些字段的可用性可能受同一个数据采集或数据来源条件影响 "
-" 对特征工程来说，组内的缺失指示变量会重复表达同一信息，通常一个组保留一个 is_missing 标记就够了；"
-" 原字段的值仍可能各自有用，不应仅因缺失模式相同就删除 "
+# 校验结果：
+# 相同缺失率的字段组内，样本层面的缺失位置完全重合（同缺失、同有值），
+# 表明这些字段通常来自同一数据采集来源。
+# 特征工程中同组字段只需保留一个缺失标记衍生变量；原字段数值仍按各自特征保留。
 
 missing_summary_nonzero = missing_summary_nonzero.merge(
     raw_features_summary[['Row', 'Description']],
     on='Row',
     how='left')
 
-" 缺失率较高的字段大部分是与房屋相关 "
-" 说明一部分申请人缺少相关房屋信息，而不是数据随机缺失 "
+# 缺失率较高的特征主要集中在房屋标准化信息字段，属于非随机缺失（未填报或无相关资产）。
 
 raw_features_summary.to_csv(EDA_OUTPUT_PATH / 'raw_features_summary.csv', index=False)
 
@@ -226,9 +217,9 @@ gc.collect()
 
 # %%
 "三、双变量分析与风险单调性检验（Bivariate & Risk Discrimination）"
-# 对 TARGET 以外的全部业务特征做统一最优分箱与 IV 统计摸底，再按 IV 降序查看，最后附加业务类别
-# 使用 optbinning 对数值和类别变量批量最优分箱，缺失与常见特殊编码单独处理
-# 这是训练样本上的单变量基准 IV 统计值（仅做摸底统计，不剔除任何特征）
+# 对 TARGET 以外的全部业务特征统一最优分箱与 IV 统计摸底，再按 IV 降序查看
+# 使用 optbinning 批量最优分箱，缺失值与特殊编码单独分箱
+# 摸底统计阶段仅计算基准 IV，不剔除特征
 
 "3.1 全量业务特征 IV 计算与降序排名"
 # 1. 区分特征列表与类别型变量
@@ -237,33 +228,28 @@ feature_cols = [c for c in train.columns if c not in ignore_cols]
 cat_cols = train[feature_cols].select_dtypes(include=['object', 'category']).columns.tolist()
 
 # 2. 配置特殊值编码（Home Credit 中 365243 代表退休/无业特殊编码，XNA 代表未知类别）
-# 也可传入字典针对不同特征指定不同特殊值，如：{'DAYS_EMPLOYED': [365243], 'CODE_GENDER': ['XNA']}
 special_codes = [365243, 'XNA']
 
 # 3. 配置底层分箱规则（透传给每个特征的 OptimalBinning）
-# EDA 阶段底层分箱配置：放开单调性限制，允许发现峰值(peak)/谷值(valley)
+# EDA 阶段底层分箱配置：放开单调性限制，允许发现峰值/谷值以评估理论最大 IV
 eda_fit_params = {
     col: {
-        "monotonic_trend": "auto",          # 强制严格单调递增或递减（若允许U型可设为 "auto"）
-                                            # EDA 摸底阶段设置为auto，发现真实的业务规律以及快速算出特征的理论最大 IV 上限
-        #"min_n_bins":                      # 这里不设置最小分箱数量，防范高同值率特征导致求解器报错或强行切分，
-                                            # 并可通过 n_bins == 1 直接识别无区分度的特征
-        "cat_cutoff": 0.05                  # 类别型变量中占比低于 5% 的长尾稀有类别自动合并为 "others"
+        "monotonic_trend": "auto",          # 设为 auto 允许单峰/单谷，便于摸底特征的最大可达 IV
+        #"min_n_bins":                      # 不设最小分箱数，避免高同值率字段报错，并可通过 n_bins==1 识别无区分度特征
+        "cat_cutoff": 0.05                  # 占比低于 5% 的长尾稀有类别合并为 others
     } 
     for col in feature_cols
 }
 
-# 4.实例化 EDA 专用 BinningProcess
+# 4. 实例化 EDA 专用 BinningProcess
 binning_process = BinningProcess(
-    variable_names=feature_cols,                 # 需要批量分箱的特征列名列表
-    categorical_variables=cat_cols,              # 显式指定类别型或离散状态特征
-    max_n_bins=8,                                # 最大分箱数（不含缺失箱和特殊值箱），评分卡通常限制在 5~6 箱以防过拟合
-                                                 # EDA 阶段切 8~10 箱，观察更细腻的风险趋势
-    min_bin_size=0.02,                           # 单个分箱的最小样本占比，一般设置5%，放宽至 2%，捕捉尾部极端风险
-    special_codes=special_codes,                 # 特殊编码列表
-                                                 # 命中这些值的样本会脱离常规分箱
+    variable_names=feature_cols,
+    categorical_variables=cat_cols,
+    max_n_bins=8,                                # 最大分箱数（EDA 阶段设为 8 箱观察细分趋势）
+    min_bin_size=0.02,                           # 单箱最小样本占比设为 2% 捕捉尾部样本
+    special_codes=special_codes,                 # 特殊编码单独成箱
     binning_fit_params=eda_fit_params,
-    selection_criteria=None,                     # EDA 阶段不剔除任何变量，全量输出体检结果
+    selection_criteria=None,                     # EDA 阶段不剔除变量，全量输出体检结果
     n_jobs=-1
 )
 
@@ -352,11 +338,10 @@ del high_iv_features
 gc.collect()
 
 # %%
-# 数据隔离与稳定性说明：
-# 1. EDA 阶段严格基于训练集 train 进行探索，不计算测试集的单变量 PSI，
-#    避免测试集信息渗入特征评估造成潜在数据穿越；
-# 2. 训练集与测试集的跨客群分布偏移评估已由 02_adversarial_validation.py（对抗验证）独立承担；
-# 3. 模型层面的跨客群稳定性指标（总分/预测概率 PSI）在下游建模（04/05 脚本）完成后统一评估。
+# 数据隔离说明：
+# 1. EDA 仅基于训练集探索，不计算测试集的单变量 PSI，避免信息泄露；
+# 2. 训练集与测试集的分布差异评估由 02_adversarial_validation.py 独立完成；
+# 3. 模型总分与预测概率的跨客群 PSI 在下游建模（04/05 脚本）完成后评估。
 
 # 清理训练集大表、分箱器及所有剩余变量，释放内存
 del train, raw_features_summary, feature_cols, binning_process

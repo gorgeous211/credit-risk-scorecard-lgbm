@@ -2,30 +2,24 @@
 # =============================================================================
 # 数据预处理：原始训练集分层切分（训练集与验证集）
 # =============================================================================
-# 一、背景与设计目的
-# 为避免数据穿越（Data Leakage）与数据窥探（Data Snooping）：
-# 若在切分训练集与验证集之前，对全量数据计算缺失率、同值率、异常值截断阈值，
-# 或利用全量标签计算 IV/WOE 筛选特征，验证集信息就会提前渗入建模流程，
-# 导致本地评估的 AUC 和 KS 产生乐观偏差，无法客观反映未见样本上的表现。
+# 一、背景与目的
+# 避免数据穿越（Data Leakage）：
+# 若在切分训练集与验证集前对全量数据统计缺失率、计算截断阈值或用标签计算 IV/WOE，
+# 验证集信息会提前渗入，导致本地评估的 AUC/KS 虚高。
+# 因此在开展 EDA 与特征工程前，先切分并隔离训练集与验证集。
 #
-# 因此，在开展任何探索性分析（EDA）与特征工程前，先将原始训练集做物理隔离。
+# 二、采用分层抽样（Stratified Sampling）的原因
+# 违约样本占比约 8.07%，样本分布不均衡。
+# 普通随机抽样可能因抽样波动造成验证集坏账率偏移，影响 Base Odds 与概率标定。
+# 分层抽样可保持切分前后两份数据的违约率一致。
 #
-# 二、为什么采用分层抽样（Stratified Sampling）
-# 申请主表违约样本仅占约 8.07%，属于典型的不平衡分类场景。
-# 普通随机抽样容易因抽样波动导致验证集的坏样本比例产生偏差，
-# 进而影响基准好坏比（Base Odds）与违约概率的标定。
-# 采用分层抽样能使切分后的训练集与验证集的先验违约率严格一致。
-#
-# 三、数据集划分与分工
-# 1. 训练集（Train, 80%）：
-#    用于后续的 EDA 探索、缺失值与异常值规则定义、分箱拟合（fit）、
-#    IV 计算与特征筛选、模型训练及内部交叉验证。
-# 2. 验证集（Valid, 20%）：
-#    独立切分封存，不参与任何规则拟合；
-#    模型训练完成后仅执行映射（transform）与推理，用于独立评估 AUC 与 KS。
-# 3. 测试集（Test, 4.8 万条）：
-#    对应未标注测试集（application_test.csv），无 TARGET 标签，
-#    输入训练好的模型输出预测分值/概率，用于跨客群稳定性（PSI）评估。
+# 三、数据集划分
+# 1. 训练集（Train，80%）：
+#    用于 EDA、数据清洗规则定义、分箱拟合、IV 计算、特征筛选及模型训练。
+# 2. 验证集（Valid，20%）：
+#    独立封存，不参与规则拟合；模型训练完成后仅执行映射与推理，用于评估 AUC 和 KS。
+# 3. 测试集（Test，4.8 万条）：
+#    对应 application_test.csv，无 TARGET 标签，用于评估跨客群预测分值的稳定性（PSI）。
 # =============================================================================
 
 # %%
@@ -70,16 +64,13 @@ raw_train.duplicated(subset='SK_ID_CURR').any()
 # 标签列检查
 'TARGET' in raw_train.columns
 # True
-# 标签列在训练集的列中
 
 raw_train['TARGET'].isna().sum() == 0
-# True
-# 没有缺失值
+# True (无缺失值)
 
 unique_targets = set(raw_train['TARGET'].unique())
 unique_targets.issubset({0, 1})
-# True
-# 只有0、1二元取值
+# True (二元标签 0 和 1)
 
 overall_bad_count = int(raw_train['TARGET'].sum())
 overall_good_count = len(raw_train) - overall_bad_count
@@ -88,18 +79,17 @@ overall_bad_rate = raw_train['TARGET'].mean()
 print(f"标签分布: 正常(0) = {overall_good_count:,} | 违约(1) = {overall_bad_count:,} | 坏账率 = {overall_bad_rate:.4%}")
 # 标签分布: 正常(0) = 282,686 | 违约(1) = 24,825 | 坏账率 = 8.0729%
 
-# 清理步骤 1 校验中间变量
+# 清理核验临时变量
 del unique_targets
 
 # %%
 # =============================================================================
 # 2. 执行分层抽样切分
 # =============================================================================
-# 参数设计考量：
-# - test_size = 0.20：按 8:2 划分，训练集保留约 24.6 万条样本以学习细分特征，
-#   验证集保留约 4,965 个违约样本，保证 KS 与 AUC 评估的统计稳定性。
+# 切分参数：
+# - test_size = 0.20：按 8:2 切分，验证集含约 4,965 个违约样本，保证评估稳定性。
 # - random_state = 123：固定随机种子，保证切分结果可复现。
-# - shuffle = True：切分前打乱样本顺序，消除可能的物理存储序列关联。
+# - shuffle = True：切分前打乱样本顺序。
 # - stratify = raw_train['TARGET']：按标签比例分层抽样，保持两份数据坏账率一致。
 # =============================================================================
 
@@ -144,7 +134,7 @@ abs(train_bad_rate - valid_bad_rate) < 1e-4
 # 导出切分审计报告至 outputs/validation
 split_audit_df.to_csv(SPLIT_AUDIT_PATH, index=False)
 
-# 清理步骤 3 核验中间变量及已完成使命的原始数据
+# 清理核验临时变量与原始数据
 del train_ids, valid_ids, intersection_ids
 del train_bad_rate, valid_bad_rate
 del raw_train, overall_good_count, overall_bad_count, overall_bad_rate
@@ -155,17 +145,16 @@ gc.collect()
 # =============================================================================
 # 4. 数据文件落盘
 # =============================================================================
-# 输出约定：
-# 1. application_train_split.csv (80% 训练集)：
-#    保存在 data/interim/，作为 01_eda.py、03_feature_engineering.py、04_scorecard_modeling.py
-#    和 05_lightgbm_modeling.py 的训练输入。
-# 2. application_valid.csv (20% 验证集)：
-#    保存在 data/interim/，作为模型完成训练后的独立验证集，仅执行无监督映射与评分评估。
+# 输出说明：
+# 1. application_train_split.csv（80% 训练集）：
+#    保存在 data/interim/，作为下游各建模脚本的训练输入。
+# 2. application_valid.csv（20% 验证集）：
+#    保存在 data/interim/，作为独立验证集，仅用于评估阶段的映射与推理。
 # =============================================================================
 # 导出训练集与验证集
 train.to_csv(TRAIN_PATH, index=False)
 valid.to_csv(VALID_PATH, index=False)
 
-# 清理落盘中间变量与数据集，释放内存
+# 清理落盘中间变量并释放内存
 del train, valid
 gc.collect()

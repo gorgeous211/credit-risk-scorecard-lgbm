@@ -1,5 +1,4 @@
-# 训练集与测试集对比
-# 使用lightgbm进行对抗性验证
+# 训练集与测试集分布检验：基于 LightGBM 的对抗验证
 
 # %%
 from pathlib import Path
@@ -30,74 +29,54 @@ test['is_test'] = 1
 # 合并训练集和测试集
 application = pd.concat([train, test], ignore_index=True)
 
-# 类别特征转换为category类型，使lightgbm可以直接处理
+# 将类别特征转换为 category 类型，适配 LightGBM 原生接口
 obj_cols = application.select_dtypes(include='object').columns
 for col in obj_cols:
     application[col] = application[col].astype('category')
 
-# 切分X和y
+# 切分特征 X 与标签 y
 X = application.drop(columns='is_test')
 y = application['is_test']
 
-# 设置分层五折交叉验证
+# 设置分层 5 折交叉验证
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=123)
 oof_preds = np.zeros(len(X))
 feature_importance = np.zeros(X.shape[1])
 
-# learning_rate、n_estimators根据经验确定，min_child_sample根据数据集确定
-# max_depth、num_leaves、subsample、colsample_bytree、reg_alpha、reg_lambda通过算法搜索参数
-
-# min_child_samples: 根据数据集样本量 N 确定，经验比例约为 N 的 0.01% ~ 0.1%：
-#   - 小样本 (N < 1万): 10 ~ 20 (默认20)
-#   - 中等样本 (1万 ~ 10万): 20 ~ 50
-#   - 较大样本 (10万 ~ 100万，如本项目约35万): 50 ~ 200 (此处取50)
-#   - 超大样本 (N > 100万): 200 ~ 2000+
-#   调大该参数可防止叶节点拟合局部噪声，对抗验证中尤其需要适度调大以捕捉宏观分布漂移
-# max_depth: 一般在3，4，5中取一个
-# num_leaves: LightGBM中与max_depth配合，要小于2^max_depth-1
-# subsample: 一般给出大致的搜索范围如[0.8, 0.9, 1.0]这样几个比较整的数值
-# colsample_bytree: 与subsample同理
-# reg_alpha与reg_lambda，一般在1-1000的范围调参，比较好的模型上这俩参数值不应该过大，尤其是reg_alpha，过大的话需要查看特征
-
-# 对抗验证不需要网络搜索调参，重点防止过拟合，避免捕捉虚假漂移
+# 对抗验证参数设计：
+# 核心是捕捉宏观分布差异并防止过拟合，无需网格调参。
+# - min_child_samples：总样本量约 35 万，取 50 避免叶节点拟合局部噪声。
+# - max_depth / num_leaves：浅树结构（depth=5, leaves=16），控制树复杂度。
+# - subsample / colsample_bytree：设为 0.8，避免少数特征主导分裂。
+# - class_weight：保持 None，使预测概率反映实际样本密度比。
 params = { 
-    # 复杂度控制参数
-    # 浅树更倾向于捕捉全局性特征分布差异，避免深树在叶节点上对个别样本强行切分
-    'max_depth': 5,             # 默认-1，树的最大深度， 一般在3、4、5这三个数里挑一个
-    'num_leaves': 16,           # 默认31，树的最大叶子数。从31下调至16(远低于2^5=32)
-                                # 对抗验证核心是捕捉宏观分布漂移并严格防止过拟合，若设为31会使树几乎满分裂，
-                                # 失去Leaf-wise剪枝控制复杂度的意义，容易细碎划分拟合局部噪声产生“虚假漂移”
-    'min_child_samples': 50,    # 默认20，单个叶子节点上所需的最小样本数
-                                # 调大该参数，防止叶节点样本数过少导致的局部过拟合
+    # 复杂度控制
+    'max_depth': 5,             # 树最大深度
+    'num_leaves': 16,           # 叶子节点数（远小于 2^5=32，控制树复杂度）
+    'min_child_samples': 50,    # 单叶子节点最小样本数，防止局部过拟合
                                 
-    # 采样与扰动参数
-    'subsample': 0.8,           # 默认1.0，行采样比例（样本子集比例）
-    'subsample_freq': 1,        # 默认0，行采样频率。0 表示不启用 bagging；若设为k，则每k轮迭代采样一次
-    'colsample_bytree': 0.8,    # 默认1.0，列采样比例，每棵树构建时采样的特征比例
-                                # 调小该参数，防止少数强漂移特征在每棵树中都占据绝对主导地位
-                                # 强制模型去探索其他次要特征的漂移情况
+    # 采样与扰动
+    'subsample': 0.8,           # 样本行采样比例
+    'subsample_freq': 1,        # 采样频率
+    'colsample_bytree': 0.8,    # 特征列采样比例，促进探索次要特征
     
-    # 正则化与迭代参数
-    'reg_alpha': 0.5,           # 默认0.0，L1正则化系数
-    'reg_lambda': 1.0,          # 默认0.0，L2正则化系数
-    'learning_rate': 0.05,      # 默认0.1，调小该参数提升模型上限与泛化能力
-    'n_estimators': 1000,       # 默认100，迭代轮数（基学习器的最大数量），
-                                # 由于调小learning_rate并且加入了早停机制，调大该参数
-    # 任务与目标参数
-    'objective': 'binary',      # 默认None，binary代表二分类任务
-    'metric': 'auc',
-    'class_weight': None,       # 默认None。对抗验证不建议设置balanced：
-                                # ①测试集样本达4.8万(占13.7%)，绝对量充沛非极端不平衡；
-                                # ②AUC衡量全局相对排序能力，对类别不平衡天然鲁棒；
-                                # ③保持自然比例可保证预测概率反映真实的数据分布密度比，避免分裂增益过度偏向测试集，也便于后续做样本重要性加权或概率校准
+    # 正则化与迭代
+    'reg_alpha': 0.5,           # L1 正则化
+    'reg_lambda': 1.0,          # L2 正则化
+    'learning_rate': 0.05,
+    'n_estimators': 1000,       # 配合早停使用
 
-    'random_state': 123,        # 默认None，随机种子
-    'importance_type': 'gain',  # 默认'split'，特征重要性计算方式，'gain'表示按信息增益计算
-    'n_jobs': -1,               # 默认None，-1代表使用全部CPU核心
+    # 目标与评估
+    'objective': 'binary',
+    'metric': 'auc',
+    'class_weight': None,       # 测试集占比 13.7%，保持原始比例可反映实际密度比
+    'random_state': 123,
+    'importance_type': 'gain',  # 按信息增益计算特征重要性
+    'n_jobs': -1,
 }
 
 callbacks = [lgb.early_stopping(
-    stopping_rounds=50,         # 不需要迭代太多轮次，过晚停止往往意味着在拟合噪声
+    stopping_rounds=50,         # 连续 50 轮未提升则早停
     verbose=True)]
 
 for train_idx, val_idx in skf.split(X, y):
@@ -138,9 +117,9 @@ importance_df.head(10)
 # 38           ORGANIZATION_TYPE   23038.961704
 # 93      DAYS_LAST_PHONE_CHANGE   20621.832702
 
-# 通过AUC的值可以得出，训练集和测试集二者存在可检测的特征分布差异
-# AMT_CREDIT、AMT_ANNUITY 等排名靠前，可作为进一步检查分布差异的重点变量
-# 该结果反映当前模型的区分能力；要判断具体漂移特征及其对违约预测的影响，还需比较这些变量的训练集与测试集分布
+# 结论说明：
+# 对抗验证 AUC 约为 0.89，表明训练集与测试集存在可识别的特征分布差异。
+# AMT_CREDIT、AMT_ANNUITY 等金额特征排名靠前，说明金额类变量在训练集与测试集间有较明显分布偏离。
 
 # %%
 # 保存对抗验证特征重要性表至 outputs/validation
