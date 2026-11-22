@@ -33,6 +33,7 @@ EDA_OUTPUT_PATH = OUTPUTS_PATH / "eda"
 EDA_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 print("正在读取原始与切分数据集...")
+# 正在读取原始与切分数据集...
 # 1. 训练集（唯一规则拟合来源，80%）
 train = pd.read_csv(INTERIM_DATA_PATH / 'application_train_split.csv')
 
@@ -50,6 +51,7 @@ house_cols = raw_features_summary.loc[
 ].tolist()
 
 print(f"数据读取完成: 训练集 {train.shape}, 验证集 {valid.shape}, 测试集 {test.shape}")
+# 数据读取完成: 训练集 (246008, 122), 验证集 (61503, 122), 测试集 (48744, 121)
 
 # %%
 # =============================================================================
@@ -222,10 +224,14 @@ def add_all_derived_features(df, house_cols_list, raw_feature_cols_list):
 
 
 print("正在执行全量数据集清洗与 7 大通用维度特征衍生...")
+# 正在执行全量数据集清洗与 7 大通用维度特征衍生...
 for dataset_name, df_obj in [("训练集", train), ("验证集", valid), ("测试集", test)]:
     clean_anomalies(df_obj)
     add_all_derived_features(df_obj, house_cols, raw_feature_cols)
     print(f"✓ {dataset_name} 特征衍生完成，当前特征数: {df_obj.shape[1]}")
+# ✓ 训练集 特征衍生完成，当前特征数: 160
+# ✓ 验证集 特征衍生完成，当前特征数: 160
+# ✓ 测试集 特征衍生完成，当前特征数: 159
 
 # %%
 # =============================================================================
@@ -239,6 +245,7 @@ for dataset_name, df_obj in [("训练集", train), ("验证集", valid), ("测�
 # 分组收入均值仅在训练集上计算，验证集和测试集通过 left join 匹配，避免统计量泄露。
 # =============================================================================
 print("正在拟合行业与职业分组基准统计量 (严格仅限训练集)...")
+# 正在拟合行业与职业分组基准统计量 (严格仅限训练集)...
 # [8.1] OCCUPATION_TYPE_INCOME_MEAN: 同一职业群体的平均收入基准
 occupation_stats = train.groupby(
     'OCCUPATION_TYPE', observed=True
@@ -258,6 +265,7 @@ test['INCOME_TO_OCCUPATION_TYPE_RATIO'] = (
     test['AMT_INCOME_TOTAL'] / test['OCCUPATION_TYPE_INCOME_MEAN']
 )
 print("✓ 完成 OCCUPATION_TYPE 收入基准均值与相对比率构造")
+# ✓ 完成 OCCUPATION_TYPE 收入基准均值与相对比率构造
 
 # [8.3] ORGANIZATION_TYPE_INCOME_MEAN: 同一行业群体的平均收入基准
 organization_stats = train.groupby(
@@ -278,6 +286,7 @@ test['INCOME_TO_ORGANIZATION_TYPE_RATIO'] = (
     test['AMT_INCOME_TOTAL'] / test['ORGANIZATION_TYPE_INCOME_MEAN']
 )
 print("✓ 完成 ORGANIZATION_TYPE 收入基准均值与相对比率构造")
+# ✓ 完成 ORGANIZATION_TYPE 收入基准均值与相对比率构造
 
 del occupation_stats, organization_stats, house_cols, raw_feature_cols
 
@@ -291,6 +300,7 @@ feature_cols = [c for c in train.columns if c not in ignore_cols]
 derived_cols = [c for c in feature_cols if c not in raw_features_summary['Row'].values]
 
 print(f"\n全量候选特征池构建完毕！总特征数: {len(feature_cols)} 个 (含 {len(derived_cols)} 个新增衍生特征)")
+# 全量候选特征池构建完毕！总特征数: 162 个 (含 42 个新增衍生特征)
 
 # 汇总全量特征字典体检表 (仅基于训练集自身统计)
 missing_rates = train[feature_cols].isna().mean()
@@ -309,6 +319,7 @@ full_features_summary = pd.DataFrame({
 
 # 落盘全量特征宽表至 data/processed/
 print("正在将全量特征宽表落盘至 data/processed/ ...")
+# 正在将全量特征宽表落盘至 data/processed/ ...
 train.to_csv(PROCESSED_DATA_PATH / 'train_features_full.csv', index=False)
 valid.to_csv(PROCESSED_DATA_PATH / 'valid_features_full.csv', index=False)
 test.to_csv(PROCESSED_DATA_PATH / 'test_features_full.csv', index=False)
@@ -323,6 +334,13 @@ print(f"  2. 验证集宽表 : {PROCESSED_DATA_PATH / 'valid_features_full.csv'}
 print(f"  3. 测试集宽表 : {PROCESSED_DATA_PATH / 'test_features_full.csv'} (样本数: {len(test):,}, 字段数: {test.shape[1]})")
 print(f"  4. 全量特征字典账本: {EDA_OUTPUT_PATH / 'full_features_summary.csv'}")
 print("=" * 70)
+# ======================================================================
+# ✓ [统一特征工程构建完成 - 审计清单]
+#   1. 训练集宽表 : D:\0.My-Projects\home-credit-default-risk\data\processed\train_features_full.csv (样本数: 246,008, 字段数: 164)
+#   2. 验证集宽表 : D:\0.My-Projects\home-credit-default-risk\data\processed\valid_features_full.csv (样本数: 61,503, 字段数: 164)
+#   3. 测试集宽表 : D:\0.My-Projects\home-credit-default-risk\data\processed\test_features_full.csv (样本数: 48,744, 字段数: 163)
+#   4. 全量特征字典账本: D:\0.My-Projects\home-credit-default-risk\outputs\eda\full_features_summary.csv
+# ======================================================================
 
 # 清理内存
 del train, valid, test, raw_features_summary, full_features_summary

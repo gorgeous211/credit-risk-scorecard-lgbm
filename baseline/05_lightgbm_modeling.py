@@ -36,6 +36,7 @@ MODEL_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 # 1. 数据集读取与特征类型转换（直接对接统一特征工程全量宽表）
 # =============================================================================
 print("正在加载统一特征工程全量宽表...")
+# 正在加载统一特征工程全量宽表...
 train = pd.read_csv(PROCESSED_DATA_PATH / 'train_features_full.csv')
 valid = pd.read_csv(PROCESSED_DATA_PATH / 'valid_features_full.csv')
 test = pd.read_csv(PROCESSED_DATA_PATH / 'test_features_full.csv')
@@ -55,6 +56,8 @@ for col in cat_cols:
 
 print(f"数据加载完成: 训练集 {train.shape}, 验证集 {valid.shape}, 测试集 {test.shape}")
 print(f"初始候选特征数: {len(all_feature_cols)} (其中类别型: {len(cat_cols)}, 数值型: {len(all_feature_cols) - len(cat_cols)})")
+# 数据加载完成: 训练集 (246008, 164), 验证集 (61503, 164), 测试集 (48744, 163)
+# 初始候选特征数: 162 (其中类别型: 16, 数值型: 146)
 
 # %%
 # =============================================================================
@@ -90,6 +93,8 @@ candidate_feature_cols = [c for c in all_feature_cols if c not in delete_feature
 
 print(f"✓ 粗筛完成: 剔除同值率>95%字段 {len(high_pvr_cols)} 个、极端共线(|r|>=0.95)字段 {len(set(high_corr))} 个")
 print(f"  剩余供增益初筛的候选特征数: {len(candidate_feature_cols)}")
+# ✓ 粗筛完成: 剔除同值率>95%字段 21 个、极端共线(|r|>=0.95)字段 41 个
+#   剩余供增益初筛的候选特征数: 100
 
 del high_pvr_cols, high_corr, result, features_corr, orig_num_cols, delete_features, primary_value_ratios, missing_dict
 gc.collect()
@@ -123,6 +128,7 @@ baseline_params = {
 }
 
 print("\n正在运行 5 折交叉验证基准模型计算各特征分裂增益 (Gain Importance)...")
+# 正在运行 5 折交叉验证基准模型计算各特征分裂增益 (Gain Importance)...
 feature_importance = np.zeros(X.shape[1])
 for fold, (train_idx, valid_idx) in enumerate(skf.split(X, y), 1):
     X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
@@ -158,6 +164,8 @@ if len(selected_feature_cols) < len(importance_df):
 importance_df.to_csv(MODEL_OUTPUT_PATH / 'lgb_feature_importance.csv', index=False)
 print(f"✓ 分裂增益精筛完成！累计增益前 95% 特征数: {len(selected_feature_cols)} (原始候选: {len(candidate_feature_cols)})")
 print(f"  增益特征重要性榜单已落盘至: {MODEL_OUTPUT_PATH / 'lgb_feature_importance.csv'}")
+# ✓ 分裂增益精筛完成！累计增益前 95% 特征数: 53 (原始候选: 100)
+#   增益特征重要性榜单已落盘至: D:\0.My-Projects\home-credit-default-risk\outputs\models\lgb_feature_importance.csv
 
 del X, feature_importance, baseline_params
 gc.collect()
@@ -212,6 +220,7 @@ def objective(trial):
     return np.mean(cv_scores)
 
 print("\n正在启动 Optuna 进行 30 次 TPE 贝叶斯超参数调优...")
+# 正在启动 Optuna 进行 30 次 TPE 贝叶斯超参数调优...
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=123))
 study.optimize(objective, n_trials=30, timeout=1800, show_progress_bar=False)
@@ -227,6 +236,14 @@ print(f"    - subsample: {study.best_params['subsample']}")
 print(f"    - colsample_bytree: {study.best_params['colsample_bytree']}")
 print(f"    - reg_alpha: {study.best_params['reg_alpha']:.4f}")
 print(f"    - reg_lambda: {study.best_params['reg_lambda']:.4f}")
+# ✓ Optuna 搜索完成！最佳 5 折 CV AUC: 0.76758
+#   最佳超参数组合:
+#     - max_depth: 4
+#     - num_leaves: 14
+#     - subsample: 0.9
+#     - colsample_bytree: 0.8
+#     - reg_alpha: 3.6256
+#     - reg_lambda: 1.1821
 
 del objective
 gc.collect()
@@ -254,6 +271,7 @@ final_params = {
 }
 
 print(f"\n正在使用最优超参数在精选的 {len(selected_feature_cols)} 个核心特征上执行 5 折完整集成训练...")
+# 正在使用最优超参数在精选的 53 个核心特征上执行 5 折完整集成训练...
 
 X_valid_final = valid[selected_feature_cols].copy()
 X_test_final = test[selected_feature_cols].copy()
@@ -288,6 +306,11 @@ for fold, (train_idx, valid_idx) in enumerate(skf.split(X_final, y), 1):
     fold_auc = roc_auc_score(y_va, val_pred)
     fold_ks = calc_ks(y_va, val_pred)
     print(f"  Fold {fold} | AUC: {fold_auc:.5f} | KS: {fold_ks:.5f}")
+#   Fold 1 | AUC: 0.76890 | KS: 0.40158
+#   Fold 2 | AUC: 0.76731 | KS: 0.39645
+#   Fold 3 | AUC: 0.76445 | KS: 0.39805
+#   Fold 4 | AUC: 0.76618 | KS: 0.40295
+#   Fold 5 | AUC: 0.77104 | KS: 0.40556
 
 # (1) 训练集 5 折 OOF 评估
 cv_auc = roc_auc_score(y, oof_preds)
@@ -316,6 +339,13 @@ print("\n" + "=" * 70)
 print("✓ [LightGBM 建模与评估完成 - 汇总账本]")
 print(eval_summary_df.to_string(index=False))
 print("=" * 70)
+# ======================================================================
+# ✓ [LightGBM 建模与评估完成 - 汇总账本]
+#                    数据集    样本量    AUC     KS  跨客群预测概率 PSI
+# 训练集 (Train 5-Fold OOF) 246008 0.7676 0.3991 基准 (0.00000)
+#            验证集 (Valid)  61503 0.7658 0.3982            -
+#             测试集 (Test)  48744      -      -      0.00141
+# ======================================================================
 
 del train, valid, test, X_final, X_valid_final, X_test_final
 del oof_preds, valid_preds, test_preds, prob_combiner, eval_summary_df

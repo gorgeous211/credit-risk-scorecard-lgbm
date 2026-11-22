@@ -1,6 +1,8 @@
-# Home Credit Default Risk: 传统统计评分卡（LR）与机器学习提升树（LightGBM）信贷违约预测
+# 零售信贷违约风险预测建模（评分卡 & LightGBM）
 
-[![Python](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/) [![Package Manager](https://img.shields.io/badge/managed%20by-uv-purple.svg)](https://github.com/astral-sh/uv) [![LightGBM](https://img.shields.io/badge/Model-LightGBM-brightgreen.svg)](https://lightgbm.readthedocs.io/) [![Scorecard](https://img.shields.io/badge/Model-Scorecard%20(OptBinning)-orange.svg)](https://gnpalencia.org/optbinning/) [![Validation](https://img.shields.io/badge/Validation-Zero%20Data%20Leakage-red.svg)](#) [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
+> End-to-End Retail Credit Risk Modeling Pipeline: Standard Scorecard (LR) & LightGBM
+
+[![Python](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/) [![Package Manager](https://img.shields.io/badge/managed%20by-uv-purple.svg)](https://github.com/astral-sh/uv) [![LightGBM](https://img.shields.io/badge/Model-LightGBM-brightgreen.svg)](https://lightgbm.readthedocs.io/) [![Scorecard](https://img.shields.io/badge/Model-Scorecard%20%28OptBinning%29-orange.svg)](https://gnpalencia.org/optbinning/) [![Validation](https://img.shields.io/badge/Validation-Zero%20Data%20Leakage-red.svg)](#) [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
 
 ---
 
@@ -8,7 +10,7 @@
 
 本项目基于 Kaggle 经典信贷风控赛题 [Home Credit Default Risk](https://www.kaggle.com/competitions/home-credit-default-risk)，结合信贷风控实践与合规审计要求构建。
 
-申请主表（`application_train.csv`）存在正负样本不平衡（违约率约 8.07%）、高维稀疏特征及多机构征信差异等特点。本项目搭建了分层抽样、对抗性验证、特征工程以及双轨建模（LR 评分卡与 LightGBM）的完整流程。
+申请主表（`application_train.csv`）存在正负样本不平衡（违约率约 8.07%）、高维稀疏特征及多机构征信差异等特点。本项目搭建了分层抽样、对抗性验证、特征工程以及双模型建模（LR 评分卡与 LightGBM）的完整流程。
 
 ### 核心设计点：
 
@@ -16,7 +18,8 @@
    - 在探索性数据分析（EDA）、异常值处理、分箱和特征筛选前，先按 8:2 分层切分，将 20% 的**验证集（Valid，61,503 条）单独封存**。
    - 验证集仅套用训练集拟合的规则进行转换（transform），避免全局统计量渗透造成的评估偏差。
 2. **训练集与测试集对抗性验证（Adversarial Validation）**：
-   - 使用浅层、强正则化的 LightGBM 检验训练集与测试集的分布差异（AUC 为 0.89），识别出 `AMT_CREDIT`、`AMT_ANNUITY` 等分布变化较明显的变量，供特征筛选和稳定性评估参考。
+   - 使用浅层、强正则化的 LightGBM 检验训练集与测试集的宏观分布差异（对抗验证 AUC 达到 0.89），客观证实两组样本存在显著的特征分布漂移（Covariate Shift）。
+   - 宏观对照验证：该检验仅作为宏观分布检验基准，用于反衬并证明最终模型的泛化与稳定性——在特征分布存在显著漂移的前提下，最终通过业务比率衍生、单调分箱与强正则化构建的模型，在测试集上的预测评分/概率 PSI 仅为 0.00131 与 0.00141（远低于 0.10 阈值），形成“高对抗验证 AUC 与极低模型 PSI”的鲜明对比，有力佐证了特征工程与建模策略的抗漂移能力。
 3. **8 个维度的特征工程（共 42 个衍生特征）**：
    - **异常清洗与状态衍生**：将 `DAYS_EMPLOYED == 365243`（约1000年业务编码）重置为 NaN，并提炼独立二值特征 `FLAG_DAYS_EMPLOYED_ANOMALOUS` 标识退休或无正规就业客群；将未知性别替换为众数，并将社交圈人数极端离群值（>30）联动置空。
    - **维度 1: 还款能力与负债压力变量（5 个）**：信贷收入比（杠杆倍数）、年金收入比（`ANNUITY_TO_INCOME_RATIO`，即月供占年收入比例，相当于月度 DTI 的 1/12）、月均可用净现金流代理（`FREE_INCOME_PROXY`，月均收入减去当期月供）、家庭人均年收入及抚养子女摊薄人均年收入（`INCOME_PER_CHILD`），通过相对比率降低绝对收入和地区物价差异的影响；
@@ -29,35 +32,36 @@
    - **维度 8: 行业与职业分组基准统计量（4 个，严格零穿越设计）**：仅在训练集上按职业和行业聚合计算收入均值，再通过 `left join` 映射计算借款人在同业中的相对收入比率（`INCOME_TO_OCCUPATION_TYPE_RATIO`、`INCOME_TO_ORGANIZATION_TYPE_RATIO`），消除行业间基准差异；
    - **全量特征宽表构建**：由 `03_feature_engineering.py` 统一生成并保存候选特征宽表（120 个原始特征 + 1 个异常标记 + 41 个业务衍生 = 162 个候选特征，宽表共 164 列含 ID 与 TARGET），供评分卡与 LightGBM 统一读取与分流适配。
 4. **传统统计评分卡（LR）与机器学习提升树（LightGBM）建模**：
-   - **传统统计评分卡（Logistic Regression）**：对接特征宽表，经数据质量粗筛、批量 IV 初筛（$\ge 0.02$）、房屋同源去重、Spearman 贪心去共线（$|r| \ge 0.80$）、`OptBinning` 约束分箱（单箱样本 $\ge 5\%$、坏样本 $\ge 30$、数值单调与比率 U 型放宽）、方差膨胀因子（VIF <= 5）多重共线性处理、双向逐步回归（AIC 准则）以及逻辑回归系数负符号严格校验，按常用的 PDO 刻度（基准分 600 分，Odds 翻倍 PDO = 20）输出整数评分卡。
+   - **传统统计评分卡（Logistic Regression）**：对接特征宽表，经数据质量粗筛、批量 IV 初筛（IV ≥ 0.02）、房屋同源去重、Spearman 贪心去共线（|r| ≥ 0.80）、`OptBinning` 约束分箱（单箱样本 ≥ 5%、坏样本 ≥ 30、数值单调与比率 U 型放宽）、方差膨胀因子（VIF ≤ 5）多重共线性处理、双向逐步回归（AIC 准则）以及逻辑回归系数负符号严格校验，按常用的 PDO 刻度（基准分 600 分，Odds 翻倍 PDO = 20）输出整数评分卡。
    - **机器学习提升树（LightGBM）**：对接特征宽表，保留连续分布与缺失分支，结合分层 5 折交叉验证 OOF、累计增益（Gain Importance 前 95%）精选与 Optuna TPE 贝叶斯搜索浅树与强正则超参数，完成违约概率预测并输出评估指标。
 
 ---
 
 ## 2. 实验结果与评估指标
 
-模型评估均在独立封存的**验证集（Valid）**与**测试集（Test）**上完成：
+模型评估均在独立封存的验证集（Valid）与测试集（Test）上完成：
 
 ### 2.1 模型综合性能指标对比
 
-| 模型架构                         | 数据集划分                 | 样本量     | 区分度 (ROC-AUC) | 鉴别力 (KS)   | 跨客群稳定性 (PSI) | 核心特性说明                   |
-|:---------------------------- |:--------------------- |:-------:|:-------------:|:----------:|:------------:|:------------------------ |
-| **LightGBM (5折CV + Optuna)** | 训练集 (Train 5-Fold OOF) | 246,008 | **0.7676**    | **0.3991** | 基准 (0.00000) | 5折交叉验证集成，具备非线性建模能力      |
-| **LightGBM (5折CV + Optuna)** | 验证集 (Valid)         | 61,503  | **0.7658**    | **0.3982** | —            | 独立验证集评估                    |
-| **LightGBM (5折CV + Optuna)** | 测试集 (Test)          | 48,744  | —             | —          | **0.00141**  | 跨客群表现稳定 (PSI < 0.10)      |
-| **标准信用评分卡 (OptBinning)**     | 训练集 (Train)         | 246,008 | 0.7523        | 0.3747     | 基准 (0.00000) | 单调WOE + VIF + 逐步回归，纯整数分值 |
-| **标准信用评分卡 (OptBinning)**     | 验证集 (Valid)         | 61,503  | 0.7466        | 0.3665     | —            | 独立验证集评估                    |
-| **标准信用评分卡 (OptBinning)**     | 测试集 (Test)          | 48,744  | —             | —          | **0.00131**  | 跨客群表现稳定 (PSI < 0.10)      |
+| 模型架构                         | 数据集划分                  | 样本量     | 区分度 (ROC-AUC) | 鉴别力 (KS)   | 跨客群稳定性 (PSI) | 核心特性说明                   |
+|:---------------------------- |:---------------------- |:-------:|:-------------:|:----------:|:------------:|:------------------------ |
+| **LightGBM (5折CV + Optuna)** | 训练集 (Train 5-Fold OOF) | 246,008 | **0.7676**    | **0.3991** | 基准 (0.00000) | 5折交叉验证集成，具备非线性建模能力       |
+| **LightGBM (5折CV + Optuna)** | 验证集 (Valid)            | 61,503  | **0.7658**    | **0.3982** | —            | 独立验证集评估                  |
+| **LightGBM (5折CV + Optuna)** | 测试集 (Test)             | 48,744  | —             | —          | **0.00141**  | 跨客群表现稳定 (PSI < 0.10)     |
+| **标准信用评分卡 (OptBinning)**     | 训练集 (Train)            | 246,008 | 0.7523        | 0.3747     | 基准 (0.00000) | 单调WOE + VIF + 逐步回归，纯整数分值 |
+| **标准信用评分卡 (OptBinning)**     | 验证集 (Valid)            | 61,503  | 0.7466        | 0.3665     | —            | 独立验证集评估                  |
+| **标准信用评分卡 (OptBinning)**     | 测试集 (Test)             | 48,744  | —             | —          | **0.00131**  | 跨客群表现稳定 (PSI < 0.10)     |
 
-> **群体稳定性指标（PSI）**：通常以 PSI < 0.10 作为客群分布基本稳定的参考阈值。评分卡总分与 LightGBM 预测概率在测试集上的 PSI 分别为 0.00131 和 0.00141，分布未见明显偏移。为防止数据穿越，特征筛选阶段仅使用训练集自身的质量与 IV 指标，不引入测试集进行 PSI 过滤；测试集 PSI 仅用于最终模型的稳定性验证。
+> [!NOTE]
+> **群体稳定性指标（PSI）与高对抗 AUC 对比**：通常以 PSI < 0.10 作为客群分布基本稳定的参考阈值。评分卡总分与 LightGBM 预测概率在测试集上的 PSI 分别为 0.00131 和 0.00141，分布极其稳定。值得强调的是，尽管对抗验证表明训练集与测试集特征存在显著漂移（对抗 AUC 高达 0.89），但最终模型预测输出仍保持了极佳的跨客群稳定性（高对抗 AUC 与极低模型 PSI 形成鲜明对比）。
 
 ### 2.2 样本分层审计账本 (`split_audit.csv`)
 
-| 数据集                     | 样本量     | 样本占比    | 正常客户 (0) | 违约客户 (1) | 坏账率 (Bad Rate) |
-|:----------------------- |:-------:|:-------:|:--------:|:--------:|:--------------:|
-| 原始训练集 (Raw Train)       | 307,511 | 100.00% | 282,686  | 24,825   | 8.0729%        |
-| **训练集 (Train)**         | 246,008 | 80.00%  | 226,148  | 19,860   | 8.0729%        |
-| **验证集 (Valid)**         | 61,503  | 20.00%  | 56,538   | 4,965    | 8.0728%        |
+| 数据集               | 样本量     | 样本占比    | 正常客户 (0) | 违约客户 (1) | 坏账率 (Bad Rate) |
+|:----------------- |:-------:|:-------:|:--------:|:--------:|:--------------:|
+| 原始训练集 (Raw Train) | 307,511 | 100.00% | 282,686  | 24,825   | 8.0729%        |
+| **训练集 (Train)**   | 246,008 | 80.00%  | 226,148  | 19,860   | 8.0729%        |
+| **验证集 (Valid)**   | 61,503  | 20.00%  | 56,538   | 4,965    | 8.0728%        |
 
 ---
 
@@ -65,7 +69,33 @@
 
 代码位于 `baseline/` 目录，按数字编号顺序执行：
 
+```mermaid
+flowchart TD
+    Raw["原始数据: data/raw/application_train.csv"] --> Split["00_stratified_split.py<br/>(8:2 分层切分与物理隔离)"]
+    Split --> Train["训练集: Train (80%)<br/>(仅用于拟合规则与参数学习)"]
+    Split --> Valid["验证集: Valid (20%)<br/>(独立封存，不参与任何规则 fit)"]
+
+    Train --> EDA["01_eda.py<br/>(特征体检账本)"]
+    Train --> AdvVal["02_adversarial_validation.py<br/>(LightGBM 探测跨期分布差异)"]
+
+    EDA --> FE["03_feature_engineering.py (统一特征工程)<br/>• 异常值修复与退休客群标记<br/>• 覆盖 8 大风控维度业务衍生 (41 个衍生 + 1 个标记)<br/>• 行业/职业分组基准均值与相对水平比率 (严格仅在训练集计算)<br/>• 输出全量特征宽表: train/valid/test_features_full"]
+    AdvVal --> FE
+    Valid -.->|"仅做 transform 映射<br/>(不参与拟合)"| FE
+
+    FE --> Scorecard["04_scorecard_modeling.py<br/>(传统统计评分卡：LR)<br/>• 数据质量与 IV ≥ 0.02 漏斗粗筛<br/>• 房屋同源去重与相关性贪心过滤<br/>• OptBinning 约束分箱 & WOE 编码<br/>• VIF ≤ 5 多重共线性消除<br/>• 逐步回归 (AIC) & 系数负符号校验<br/>• PDO=20, 600 基准分刻度映射"]
+    FE --> LGB["05_lightgbm_modeling.py<br/>(机器学习提升树：LightGBM)<br/>• 原生 category 类别特征适配<br/>• 剔除同值率 > 95% 特征<br/>• Spearman 宽阈值去共线 (|r| ≥ 0.95)<br/>• 5折 CV 累计分裂增益精选 (Top 95%)<br/>• Optuna TPE 贝叶斯搜索浅树与强正则<br/>• 5折模型集成推理"]
+
+    Scorecard --> Eval["统一特征映射与模型验证"]
+    LGB --> Eval
+
+    Eval --> MetricValid["验证集 AUC / KS 独立评估"]
+    Eval --> MetricTest["测试集总分 / 概率 PSI 跨客群稳定性"]
 ```
+
+<details>
+<summary>点击展开 ASCII 字符版架构图</summary>
+
+```text
                     [ 原始数据: data/raw/application_train.csv ]
                                        │
                 ┌──────────────────────┴──────────────────────┐
@@ -110,6 +140,8 @@
  [ 验证集 AUC / KS 独立评估 ]       [ 测试集总分 / 概率 PSI 跨客群稳定性 ]
 ```
 
+</details>
+
 ---
 
 ## 4. 核心脚本解析
@@ -119,13 +151,13 @@
 - **`baseline/01_eda.py`**：
   分析训练集 120 余个字段的统计量、缺失率、主要值占比、单变量分箱、IV、JS 散度与 Gini 系数；处理房屋信息集中缺失与 `DAYS_EMPLOYED=365243` 异常值，输出原始特征画像表 `raw_features_summary.csv`。
 - **`baseline/02_adversarial_validation.py`**：
-  以“是否属于测试集”（`is_test`）为标签训练 LightGBM，通过浅树与限制叶节点样本量（`max_depth=5, num_leaves=16, min_child_samples=50`）检查两组样本的分布差异，保存特征重要性表至 `adversarial_validation_feature_importance.csv`。
+  以“是否属于测试集”（`is_test`）为标签训练 LightGBM，通过浅树与限制叶节点样本量（`max_depth=5, num_leaves=16, min_child_samples=50`）检验两组样本的宏观分布差异（AUC 为 0.89）。该结果仅用于证实宏观分布漂移以对照后续模型极低 PSI，不参考具体变量漂移情况进行特征筛选，严格避免数据泄露。
 - **`baseline/03_feature_engineering.py`（统一特征工程）**：
   处理异常值与退休客群标记（`FLAG_DAYS_EMPLOYED_ANOMALOUS`）；构造覆盖 8 大风控维度的 41 个业务衍生特征（共计 42 个新增衍生特征）；仅在训练集上聚合计算同行业与同职业的收入均值基准，并分别以无监督映射形式（`left join`）合并至验证集与测试集；生成并保存全量特征宽表（162 个候选特征，总宽表 164 列含 ID 与 TARGET）至 `data/processed/*_features_full.csv`，输出数据字典账本 `full_features_summary.csv`。
 - **`baseline/04_scorecard_modeling.py`（标准信用评分卡）**：
-  读取全量特征宽表。执行学历有序单调映射，通过数据质量粗筛、批量 IV 初筛（$\ge 0.02$）、房屋同源去重与全局 Spearman 秩相关贪心过滤；拟合 `OptBinning` 精细约束分箱（单箱 $\ge 5\%$、坏样本 $\ge 30$、数值单调与比率 U 型放宽）；通过迭代 VIF 诊断（$\le 5.0$）消除多重共线性，运行双向逐步回归（AIC 准则）并严格校验逻辑回归系数符号（剔除 6 个符号反转变量）；设定 PDO = 20、基准分 600 分，导出各分箱得分明细表 `final_scorecard_table.csv`（最终入模 25 个特征）并评估验证集指标与测试集 PSI。
+  读取全量特征宽表。执行学历有序单调映射，通过数据质量粗筛、批量 IV 初筛（IV ≥ 0.02）、房屋同源去重与全局 Spearman 秩相关贪心过滤；拟合 `OptBinning` 精细约束分箱（单箱 ≥ 5%、坏样本 ≥ 30、数值单调与比率 U 型放宽）；通过迭代 VIF 诊断（VIF ≤ 5.0）消除多重共线性，运行双向逐步回归（AIC 准则）并严格校验逻辑回归系数符号（剔除 6 个符号反转变量）；设定 PDO = 20、基准分 600 分，导出各分箱得分明细表 `final_scorecard_table.csv`（最终入模 25 个特征）并评估验证集指标与测试集 PSI。
 - **`baseline/05_lightgbm_modeling.py`（LightGBM 集成建模）**：
-  读取全量特征宽表。统一对齐类别变量原生 `category` 格式；剔除同值率 $> 95\%$ 字段与极端共线（$|r| \ge 0.95$）字段；运行 5 折交叉验证基准模型，按累计分裂增益（Gain Importance 前 95%）精选核心特征（入模 53 个特征）；使用 Optuna 运行 30 次 TPE 贝叶斯搜索优化浅树深度、叶子数与 L1/L2 正则化超参数；完成 5 折模型集成并评估验证集和测试集。
+  读取全量特征宽表。统一对齐类别变量原生 `category` 格式；剔除同值率 > 95% 字段与极端共线（|r| ≥ 0.95）字段；运行 5 折交叉验证基准模型，按累计分裂增益（Gain Importance 前 95%）精选核心特征（入模 53 个特征）；使用 Optuna 运行 30 次 TPE 贝叶斯搜索优化浅树深度、叶子数与 L1/L2 正则化超参数；完成 5 折模型集成并评估验证集和测试集。
 
 ---
 
@@ -185,6 +217,7 @@ home-credit-default-risk/
 ├── pyproject.toml                          # 项目依赖与配置 (uv 规范)
 ├── uv.lock                                 # 依赖版本锁定文件
 ├── .python-version                         # Python 解释器版本 (3.12)
+├── LICENSE                                 # 开源协议文件 (MIT)
 ├── .gitignore                              # Git 忽略配置
 └── README.md                               # 项目说明文档
 ```
@@ -198,21 +231,29 @@ home-credit-default-risk/
 本项目使用 [uv](https://github.com/astral-sh/uv) 管理虚拟环境与依赖。Python 版本（3.12）及第三方库均已记录在 `pyproject.toml` 与 `uv.lock` 中。
 
 #### 1. 安装 uv
+
 根据操作系统安装 `uv`（已安装可跳过）：
+
 - **Windows (PowerShell)**:
+  
   ```powershell
   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
   ```
+
 - **macOS / Linux**:
+  
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
+
 - **通过 pip 安装（备选）**:
+  
   ```bash
   pip install uv
   ```
 
 #### 2. 同步并安装依赖
+
 克隆仓库后，在项目根目录下执行 `uv sync`。`uv` 会自动读取 `.python-version` 创建 `.venv`，并安装锁定的全部依赖：
 
 ```bash
@@ -224,7 +265,9 @@ cd home-credit-default-risk
 uv sync
 ```
 
+> [!TIP]
 > **环境与硬件加速提示**：
+> 
 > 1. **执行方式**：使用 `uv run python <script.py>` 会直接在项目虚拟环境中运行脚本，无需手动激活环境。
 > 2. **NVIDIA GPU (CUDA) 加速**：LightGBM 默认使用 CPU 多线程运算。如需使用 CUDA 加速，可根据本地 CUDA 环境安装支持 GPU 的 LightGBM 构建版本。
 > 3. **Windows 动态链接库说明**：如遇 OpenBLAS / LAPACK 动态库冲突，脚本会自动优先读取虚拟环境下的 `Library/bin` 路径。

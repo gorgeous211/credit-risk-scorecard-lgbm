@@ -23,7 +23,6 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import toad
-
 from optbinning import BinningProcess, Scorecard
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
@@ -42,6 +41,7 @@ MODEL_OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 # 1. 数据集读取与候选特征池准备
 # =============================================================================
 print("正在加载统一特征工程全量宽表...")
+# 正在加载统一特征工程全量宽表...
 train_df = pd.read_csv(PROCESSED_DATA_PATH / 'train_features_full.csv')
 valid_df = pd.read_csv(PROCESSED_DATA_PATH / 'valid_features_full.csv')
 test_df = pd.read_csv(PROCESSED_DATA_PATH / 'test_features_full.csv')
@@ -65,6 +65,8 @@ candidate_features = [c for c in train_df.columns if c not in ignore_cols]
 
 print(f"数据加载完成: 训练集 {train_df.shape}, 验证集 {valid_df.shape}, 测试集 {test_df.shape}")
 print(f"评分卡初始候选特征数: {len(candidate_features)}")
+# 数据加载完成: 训练集 (246008, 164), 验证集 (61503, 164), 测试集 (48744, 163)
+# 评分卡初始候选特征数: 162
 
 # 读取原始特征画像与说明表提取房屋相关字段
 raw_features_summary = pd.read_csv(EDA_OUTPUT_PATH / 'raw_features_summary.csv')
@@ -90,6 +92,7 @@ quality_drop_cols = sorted(list(set(high_pvr_cols + high_missing_cols)))
 
 filtered_candidates = [c for c in candidate_features if c not in quality_drop_cols]
 print(f"✓ 质量初筛完成: 剔除极高同值/缺失字段 {len(quality_drop_cols)} 个，剩余 {len(filtered_candidates)} 个")
+# ✓ 质量初筛完成: 剔除极高同值/缺失字段 21 个，剩余 141 个
 
 # 区分数值型特征与类别型特征
 num_filtered = train_df[filtered_candidates].select_dtypes(include='number').columns.tolist()
@@ -126,6 +129,7 @@ metric_passed_stats = pd.DataFrame({
 metric_passed_stats = metric_passed_stats[metric_passed_stats['iv'] >= 0.02].sort_values(by='iv', ascending=False).reset_index(drop=True)
 passed_cols = metric_passed_stats['Row'].tolist()
 print(f"✓ IV 阈值准入 (IV >= 0.02): 保留特征 {len(passed_cols)} 个")
+# ✓ IV 阈值准入 (IV >= 0.02): 保留特征 79 个
 
 # (4) 房屋特征同源后缀去重与强相关面积字段去共线
 passed_house_cols = [c for c in passed_cols if c in house_cols and c in num_filtered]
@@ -171,6 +175,7 @@ for col in sorted_num_cols:
 
 candidate_model_feats = kept_num_cols + cat_passed
 print(f"✓ 贪心共线性剔除 (|r| > 0.80): 产生 {len(candidate_model_feats)} 个入模候选特征")
+# ✓ 贪心共线性剔除 (|r| > 0.80): 产生 44 个入模候选特征
 
 del spearman_corr, num_stats, sorted_num_cols, num_passed, cat_passed, cols_after_house, metric_passed_stats
 
@@ -208,6 +213,7 @@ del u_shape_cols
 
 # 实例化精细分箱器并在训练集上拟合
 print("正在执行精细约束分箱 (OptBinning)...")
+# 正在执行精细约束分箱 (OptBinning)...
 fine_binning_process = BinningProcess(
     variable_names=features,
     categorical_variables=cat_features,
@@ -246,6 +252,7 @@ del drop_initial_cat
 # 4. 多变量共线性排查、逐步回归与系数合理性校验
 # =============================================================================
 print("正在执行 WOE 相关性过滤、VIF 诊断与逐步回归...")
+# 正在执行 WOE 相关性过滤、VIF 诊断与逐步回归...
 # -- (1) WOE 相关性筛选 (|r| >= 0.80) --
 train_woe_corr = X_train_woe.corr()
 corr_pairs = train_woe_corr.stack().reset_index()
@@ -282,6 +289,7 @@ while True:
         break
 
 print(f"✓ VIF 诊断完成 (全部特征 VIF <= 5.0)，剩余特征数: {len(features)}")
+# ✓ VIF 诊断完成 (全部特征 VIF <= 5.0)，剩余特征数: 32
 
 # -- (3) 双向逐步回归 (AIC 准则) --
 stepwise_df = toad.selection.stepwise(
@@ -309,11 +317,18 @@ while True:
     else:
         del coefs, pos_coefs
         break
+#   ⚠️ 发现符号反转变量 (系数为正): PHONE_TO_EMPLOYED_RATIO，予以剔除以防风险倒挂
+#   ⚠️ 发现符号反转变量 (系数为正): INCOME_TO_OCCUPATION_TYPE_RATIO，予以剔除以防风险倒挂
+#   ⚠️ 发现符号反转变量 (系数为正): OCCUPATION_TYPE_INCOME_MEAN，予以剔除以防风险倒挂
+#   ⚠️ 发现符号反转变量 (系数为正): REG_CITY_NOT_WORK_CITY，予以剔除以防风险倒挂
+#   ⚠️ 发现符号反转变量 (系数为正): NAME_INCOME_TYPE，予以剔除以防风险倒挂
+#   ⚠️ 发现符号反转变量 (系数为正): EXT_SOURCE_MAX，予以剔除以防风险倒挂
 
 del X_train_woe
 gc.collect()
 
 print(f"✓ 逐步回归与符号校验完成！最终入模特征数: {len(final_model_feats)}")
+# ✓ 逐步回归与符号校验完成！最终入模特征数: 25
 
 # %%
 # =============================================================================
@@ -363,18 +378,21 @@ del base_odds, lr_estimator, scorecard_bp, fine_binning_fit_params
 
 # Scorecard.fit 接收训练集的原始特征值
 print("正在拟合标准评分卡并执行 PDO=20, 600 基准分刻度映射...")
+# 正在拟合标准评分卡并执行 PDO=20, 600 基准分刻度映射...
 scorecard.fit(train_df[final_model_feats], y_train)
 
 # 导出标准评分卡明细表
 scorecard_table = scorecard.table(style="detailed")
 scorecard_table.to_csv(MODEL_OUTPUT_PATH / 'final_scorecard_table.csv', index=False)
 print(f"✓ 标准评分卡明细表已导出至: {MODEL_OUTPUT_PATH / 'final_scorecard_table.csv'}")
+# ✓ 标准评分卡明细表已导出至: D:\0.My-Projects\home-credit-default-risk\outputs\models\final_scorecard_table.csv
 
 # %%
 # =============================================================================
 # 6. 模型效果综合评估（AUC、KS 与跨客群总分 PSI）
 # =============================================================================
 print("正在进行验证集评估与测试集总分 PSI 检验...")
+# 正在进行验证集评估与测试集总分 PSI 检验...
 train_prob = scorecard.predict_proba(train_df[final_model_feats])[:, 1]
 valid_prob = scorecard.predict_proba(valid_df[final_model_feats])[:, 1]
 
@@ -411,6 +429,13 @@ print("\n" + "=" * 70)
 print("✓ [标准信用评分卡建模与评估完成 - 汇总账本]")
 print(eval_summary_df.to_string(index=False))
 print("=" * 70)
+# ======================================================================
+# ✓ [标准信用评分卡建模与评估完成 - 汇总账本]
+#         数据集    样本量    AUC     KS    跨客群总分 PSI
+# 训练集 (Train) 246008 0.7523 0.3747 基准 (0.00000)
+# 验证集 (Valid)  61503 0.7466 0.3665            -
+#  测试集 (Test)  48744      -      -      0.00131
+# ======================================================================
 
 del train_df, valid_df, test_df, y_train, y_valid, train_prob, valid_prob, train_score, test_score
 del scorecard, score_combiner, eval_summary_df, scorecard_table
