@@ -222,12 +222,13 @@ gc.collect()
 # 摸底统计阶段仅计算基准 IV，不剔除特征
 
 "3.1 全量业务特征 IV 计算与降序排名"
-# 1. 区分特征列表与类别型变量
+# 1. 区分特征列表与类别型/数值型变量
 ignore_cols = ['SK_ID_CURR', 'TARGET']
 feature_cols = [c for c in train.columns if c not in ignore_cols]
 cat_cols = train[feature_cols].select_dtypes(include=['object', 'category']).columns.tolist()
+num_cols = [c for c in feature_cols if c not in cat_cols]
 
-# 2. 配置特殊值编码（Home Credit 中 365243 代表退休/无业特殊编码，XNA 代表未知类别）
+# 2. 配置特殊值编码（Home Credit 原始表尚未清洗，365243 代表退休/无业特殊编码，XNA 代表未知类别）
 special_codes = [365243, 'XNA']
 
 # 3. 配置底层分箱规则（透传给每个特征的 OptimalBinning）
@@ -235,16 +236,20 @@ special_codes = [365243, 'XNA']
 eda_fit_params = {
     col: {
         "monotonic_trend": "auto",          # 设为 auto 允许单峰/单谷，便于摸底特征的最大可达 IV
-        #"min_n_bins":                      # 不设最小分箱数，避免高同值率字段报错，并可通过 n_bins==1 识别无区分度特征
-        "cat_cutoff": 0.05                  # 占比低于 5% 的长尾稀有类别合并为 others
-    } 
-    for col in feature_cols
+    }
+    for col in num_cols
 }
+for col in cat_cols:
+    eda_fit_params[col] = {
+        "cat_cutoff": 0.01                  # 占比低于 1% 的长尾稀有类别合并为 others，避免压低高基数特征 IV
+    }
 
 # 4. 实例化 EDA 专用 BinningProcess
 binning_process = BinningProcess(
     variable_names=feature_cols,
     categorical_variables=cat_cols,
+    max_n_prebins=30,                            # 预分箱上限与 min_prebin_size 配合，使 min_bin_size=0.02 生效
+    min_prebin_size=0.02,                        # 预分箱最小样本占比设为 2%，避免被默认 5% 架空
     max_n_bins=8,                                # 最大分箱数（EDA 阶段设为 8 箱观察细分趋势）
     min_bin_size=0.02,                           # 单箱最小样本占比设为 2% 捕捉尾部样本
     special_codes=special_codes,                 # 特殊编码单独成箱
@@ -269,7 +274,7 @@ raw_features_summary = raw_features_summary.join(iv_summary.set_index('feature')
 raw_features_summary.to_csv(EDA_OUTPUT_PATH / 'raw_features_summary.csv', index=False)
 
 # 清理本单元格的临时配置变量与中间表
-del ignore_cols, cat_cols, special_codes, eda_fit_params, iv_summary
+del ignore_cols, num_cols, cat_cols, special_codes, eda_fit_params, iv_summary
 gc.collect()
 
 # %%
@@ -279,59 +284,59 @@ high_iv_features = raw_features_summary.loc[
 ].sort_values(by='iv', ascending=False)
 # 按iv值大小降序排列
 #                              Row      iv
-# 43                  EXT_SOURCE_3  0.3363
-# 42                  EXT_SOURCE_2  0.3225
-# 41                  EXT_SOURCE_1  0.1472
-# 18                 DAYS_EMPLOYED  0.1154
-# 10               AMT_GOODS_PRICE  0.0924
-# 17                    DAYS_BIRTH  0.0861
-# 28               OCCUPATION_TYPE  0.0600
-#  8                    AMT_CREDIT  0.0582
+# 43                  EXT_SOURCE_3  0.3401
+# 42                  EXT_SOURCE_2  0.3266
+# 41                  EXT_SOURCE_1  0.1575
+# 18                 DAYS_EMPLOYED  0.1162
+# 10               AMT_GOODS_PRICE  0.0934
+# 17                    DAYS_BIRTH  0.0883
+# 28               OCCUPATION_TYPE  0.0780
+#  8                    AMT_CREDIT  0.0622
+# 40             ORGANIZATION_TYPE  0.0597
 # 12              NAME_INCOME_TYPE  0.0562
-# 13           NAME_EDUCATION_TYPE  0.0506
+# 13           NAME_EDUCATION_TYPE  0.0516
 # 31   REGION_RATING_CLIENT_W_CITY  0.0499
-# 95        DAYS_LAST_PHONE_CHANGE  0.0485
+# 95        DAYS_LAST_PHONE_CHANGE  0.0491
 # 30          REGION_RATING_CLIENT  0.0465
-# 40             ORGANIZATION_TYPE  0.0433
-# 20               DAYS_ID_PUBLISH  0.0426
+# 20               DAYS_ID_PUBLISH  0.0431
 #  3                   CODE_GENDER  0.0396
-# 51                 FLOORSMAX_AVG  0.0371
-# 79                FLOORSMAX_MEDI  0.0370
-# 88                TOTALAREA_MODE  0.0364
-# 65                FLOORSMAX_MODE  0.0363
-# 16    REGION_POPULATION_RELATIVE  0.0346
-# 55                LIVINGAREA_AVG  0.0342
-# 83               LIVINGAREA_MEDI  0.0341
+# 51                 FLOORSMAX_AVG  0.0382
+# 79                FLOORSMAX_MEDI  0.0380
+# 65                FLOORSMAX_MODE  0.0374
+# 88                TOTALAREA_MODE  0.0367
+# 16    REGION_POPULATION_RELATIVE  0.0362
+#  9                   AMT_ANNUITY  0.0352
+# 55                LIVINGAREA_AVG  0.0345
+# 83               LIVINGAREA_MEDI  0.0344
 # 23                FLAG_EMP_PHONE  0.0335
-# 69               LIVINGAREA_MODE  0.0329
+# 69               LIVINGAREA_MODE  0.0332
+# 44                APARTMENTS_AVG  0.0319
 # 49                 ELEVATORS_AVG  0.0317
+# 72               APARTMENTS_MEDI  0.0317
 # 77                ELEVATORS_MEDI  0.0314
-# 72               APARTMENTS_MEDI  0.0312
-# 44                APARTMENTS_AVG  0.0311
-#  9                   AMT_ANNUITY  0.0308
+# 58               APARTMENTS_MODE  0.0311
 # 38        REG_CITY_NOT_WORK_CITY  0.0307
-# 58               APARTMENTS_MODE  0.0306
 # 63                ELEVATORS_MODE  0.0305
 # 97               FLAG_DOCUMENT_3  0.0294
-# 60  YEARS_BEGINEXPLUATATION_MODE  0.0286
-# 19             DAYS_REGISTRATION  0.0285
-# 74  YEARS_BEGINEXPLUATATION_MEDI  0.0284
-# 46   YEARS_BEGINEXPLUATATION_AVG  0.0283
-# 50                 ENTRANCES_AVG  0.0269
-# 78                ENTRANCES_MEDI  0.0267
-# 64                ENTRANCES_MODE  0.0258
-# 89            WALLSMATERIAL_MODE  0.0242
-# 90           EMERGENCYSTATE_MODE  0.0232
+# 60  YEARS_BEGINEXPLUATATION_MODE  0.0291
+# 19             DAYS_REGISTRATION  0.0291
+# 74  YEARS_BEGINEXPLUATATION_MEDI  0.0290
+# 46   YEARS_BEGINEXPLUATATION_AVG  0.0290
+# 50                 ENTRANCES_AVG  0.0270
+# 78                ENTRANCES_MEDI  0.0268
+# 89            WALLSMATERIAL_MODE  0.0260
+# 64                ENTRANCES_MODE  0.0259
+# 21                   OWN_CAR_AGE  0.0241
 # 37        REG_CITY_NOT_LIVE_CITY  0.0231
-# 21                   OWN_CAR_AGE  0.0226
+# 90           EMERGENCYSTATE_MODE  0.0223
 # 14            NAME_FAMILY_STATUS  0.0221
-# 57             NONLIVINGAREA_AVG  0.0219
+# 57             NONLIVINGAREA_AVG  0.0220
+# 85            NONLIVINGAREA_MEDI  0.0218
 # 87                HOUSETYPE_MODE  0.0218
-# 85            NONLIVINGAREA_MEDI  0.0217
-# 45              BASEMENTAREA_AVG  0.0215
-# 71            NONLIVINGAREA_MODE  0.0215
-# 73             BASEMENTAREA_MEDI  0.0215
-# 59             BASEMENTAREA_MODE  0.0207
+# 45              BASEMENTAREA_AVG  0.0217
+# 71            NONLIVINGAREA_MODE  0.0216
+# 73             BASEMENTAREA_MEDI  0.0216
+# 59             BASEMENTAREA_MODE  0.0208
 
 # 清理高 IV 特征查看临时变量
 del high_iv_features
