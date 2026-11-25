@@ -1,317 +1,281 @@
-# 零售信贷违约风险预测建模（评分卡 & LightGBM）
+# Retail Credit Default Risk Modeling (Scorecard & LightGBM)
 
-> End-to-End Retail Credit Risk Modeling Pipeline: Standard Scorecard (LR) & LightGBM
+**English** | [简体中文](README_zh.md)
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/) [![Package Manager](https://img.shields.io/badge/managed%20by-uv-purple.svg)](https://github.com/astral-sh/uv) [![LightGBM](https://img.shields.io/badge/Model-LightGBM-brightgreen.svg)](https://lightgbm.readthedocs.io/) [![Scorecard](https://img.shields.io/badge/Model-Scorecard%20%28OptBinning%29-orange.svg)](https://gnpalencia.org/optbinning/) [![Validation](https://img.shields.io/badge/Validation-Zero%20Data%20Leakage-red.svg)](#) [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
 
----
+## 1. Background and core design
 
-## 1. 项目背景与核心设计
+This project builds a retail credit default modeling pipeline on the Kaggle [Home Credit Default Risk](https://www.kaggle.com/competitions/home-credit-default-risk) dataset, following standard credit risk modeling and audit practices.
 
-本项目基于 Kaggle 经典信贷风控赛题 [Home Credit Default Risk](https://www.kaggle.com/competitions/home-credit-default-risk)，结合信贷风控实践与合规审计要求构建。
+The main application table (`application_train.csv`) has imbalanced classes (roughly 8.07% defaults), high-dimensional sparse columns, and differences across external credit bureaus. The pipeline covers stratified splitting, adversarial validation, feature engineering, a Logistic Regression scorecard, and a LightGBM model.
 
-申请主表（`application_train.csv`）存在正负样本不平衡（违约率约 8.07%）、高维稀疏特征及多机构征信差异等特点。本项目搭建了分层抽样、对抗性验证、特征工程以及双模型建模（LR 评分卡与 LightGBM）的完整流程。
+### Main design choices
 
-### 核心设计点：
+1. **Stratified splitting and isolation (zero data leakage)**
+   - Before any EDA, outlier handling, binning, or feature selection, the raw training data is split 80/20 by `TARGET`. The 20% validation set (`Valid`, 61,503 rows) stays isolated from all fitting steps.
+   - Preprocessing rules, group statistics, binning boundaries, and feature filters are fitted only on `Train`, then applied to `Valid` and `Test` by transform or left join.
+2. **Train-vs-test adversarial validation**
+   - A shallow, regularized LightGBM classifier (`max_depth=5`, `num_leaves=16`, `min_child_samples=50`) separates `Train` from `Test` with an AUC of 0.89, which shows clear covariate shift between the two datasets.
+   - Adversarial feature importances are not used to drop features, since doing so would leak test-set distribution information. Instead, the 0.89 AUC sets a reference point for input drift: even with that shift, the final models built from financial ratios, constrained binning, and regularization reach Test PSI values of 0.00133 (Scorecard) and 0.00141 (LightGBM), well below 0.10.
+3. **Feature engineering across 8 dimensions (42 derived features)**
+   - Anomaly cleaning and flagging: Resets `DAYS_EMPLOYED == 365243` (~1,000 years, used for retirees or non-salaried applicants) to `NaN` and records it in `FLAG_DAYS_EMPLOYED_ANOMALOUS`; replaces rare `'XNA'` entries in `CODE_GENDER` with `'F'`; and sets extreme social circle outliers (`OBS_* > 30`) along with their paired default counts to `NaN`.
+   - Dimension 1, Repayment ability and debt burden (5 features): `CREDIT_TO_INCOME_RATIO`, `ANNUITY_TO_INCOME_RATIO` (single payment divided by annual income), `FREE_INCOME_PROXY` (monthly income minus annuity), `INCOME_PER_PERSON`, and `INCOME_PER_CHILD`. Relative ratios reduce sensitivity to absolute income levels and regional price differences.
+   - Dimension 2, Loan terms and collateral coverage (5 features): `ANNUITY_TO_CREDIT_RATIO`, `ESTIMATED_TENURE`, `GOODS_TO_CREDIT_RATIO`, `DOWN_PAYMENT_PROXY` (positive values indicate borrower equity; negative values indicate financed fees or insurance, which carry higher default risk), and `ANNUITY_TO_GOODS_RATIO`.
+   - Dimension 3, External credit score interactions (9 features): Mean, min, max, standard deviation, triple product, dynamically normalized IV-weighted score (`EXT_SOURCE_WEIGHTED` with 2:3:5 weights), missing count (`EXT_SOURCE_NAN_CNT`), and cross-ratios with leverage and age across `EXT_SOURCE_1/2/3`.
+   - Dimension 4, Temporal stability and lifecycle ratios (8 features): Divides negative day counts by borrower age to remove age-driven correlation, covering `EMPLOYED_TO_BIRTH_RATIO`, `CAR_TO_BIRTH_RATIO`, ID/registration/phone stability ratios, `PHONE_TO_EMPLOYED_RATIO`, `AGE_AT_EMPLOYMENT`, and `REG_TO_ID_RATIO`.
+   - Dimension 5, Missingness patterns and asset completeness (3 features): Records structural missingness via `HOUSE_INFO_MISSING_RATE` (over normalized `_AVG` housing fields), `FLAG_OWN_CAR_MISSING`, and `TOTAL_NAN_COUNT` (counted only over raw columns so derived `NaN`s are not double-counted).
+   - Dimension 6, Identity verification and social circle risk (4 features): Total submitted documents (`DOCUMENTS_PROVIDED_CNT`), average address mismatch across city and region flags (`ADDRESS_MISMATCH_MEAN`), and 30/60 DPD social circle default rates (`DEF_OBS_RATIO_30`, `DEF_OBS_RATIO_60`).
+   - Dimension 7, Credit inquiry trends and short-term surge (3 features): Total bureau inquiries (`BUREAU_REQ_TOTAL` with `min_count=1` to keep all-missing rows as `NaN`), inquiry presence flag (`FLAG_BUREAU_REQ`), and short-to-long inquiry ratio (`BUREAU_REQ_SHORT_TO_LONG`).
+   - Dimension 8, Occupation and industry income benchmarks (4 features, fit on `Train` only): Computes group mean income by `OCCUPATION_TYPE` and `ORGANIZATION_TYPE` on `Train`, then maps them to `Valid` and `Test` via left join to form `INCOME_TO_OCCUPATION_TYPE_RATIO` and `INCOME_TO_ORGANIZATION_TYPE_RATIO`.
+   - Unified feature table: `03_feature_engineering.py` writes standardized wide tables (`120 raw + 1 anomaly flag + 41 business derived = 162 candidate features`; 164 columns for train and valid with `SK_ID_CURR` and `TARGET`, 163 for test) for both models.
+4. **Scorecard (LR) and LightGBM modeling**
+   - Standard credit scorecard (Logistic Regression): Loads the unified feature tables, maps education level ordinally, drops features with primary value ratio > 95% or missing rate > 90%, screens with `OptBinning` (`IV >= 0.02`, `max_n_prebins=30`, `min_prebin_size=0.02`, `cat_cutoff=0.01`, `special_codes=['XNA']`), deduplicates housing suffixes and correlated housing size fields, runs greedy Spearman filtering (`|r| > 0.80`), fits constrained fine bins (`min_bin_size >= 5%`, `min_bin_n_event >= 30`, monotonic numeric constraints with U-shape allowed on `AMT_GOODS_PRICE`, `ANNUITY_TO_CREDIT_RATIO`, and `GOODS_TO_CREDIT_RATIO`, plus empirical WOE for special and missing bins), removes WOE-space collinearity (`0.80 <= |r| < 1.0`) and `VIF > 5`, runs bidirectional AIC stepwise selection, drops sign-inverted variables until all coefficients are negative, and scales to integer points (`Base Points = 600`, `PDO = 20`).
+   - Gradient boosted trees (LightGBM): Keeps continuous distributions and native missing-value splits, aligns `category` dtypes from `Train`, drops features with primary value ratio > 95% or `|r| >= 0.95`, keeps the 53 features making up the top 95% of 5-fold CV split gain, tunes shallow-tree and L1/L2 regularization parameters across 30 Optuna TPE trials, and averages 5-fold predictions.
 
-1. **分层抽样与物理隔离（防数据穿越）**：
-   - 在探索性数据分析（EDA）、异常值处理、分箱和特征筛选前，先按 8:2 分层切分，将 20% 的**验证集（Valid，61,503 条）单独封存**。
-   - 验证集仅套用训练集拟合的规则进行转换（transform），避免全局统计量渗透造成的评估偏差。
-2. **训练集与测试集对抗性验证（Adversarial Validation）**：
-   - 使用浅层、强正则化的 LightGBM 检验训练集与测试集的宏观分布差异（对抗验证 AUC 达到 0.89），客观证实两组样本存在显著的特征分布漂移（Covariate Shift）。
-   - 宏观对照验证：该检验仅作为宏观分布检验基准，用于反衬并证明最终模型的泛化与稳定性——在特征分布存在显著漂移的前提下，最终通过业务比率衍生、单调分箱与强正则化构建的模型，在测试集上的预测评分/概率 PSI 仅为 0.00131 与 0.00141（远低于 0.10 阈值），形成“高对抗验证 AUC 与极低模型 PSI”的鲜明对比，有力佐证了特征工程与建模策略的抗漂移能力。
-3. **8 个维度的特征工程（共 42 个衍生特征）**：
-   - **异常清洗与状态衍生**：将 `DAYS_EMPLOYED == 365243`（约1000年业务编码）重置为 NaN，并提炼独立二值特征 `FLAG_DAYS_EMPLOYED_ANOMALOUS` 标识退休或无正规就业客群；将未知性别替换为众数，并将社交圈人数极端离群值（>30）联动置空。
-   - **维度 1: 还款能力与负债压力变量（5 个）**：信贷收入比（杠杆倍数）、年金收入比（`ANNUITY_TO_INCOME_RATIO`，即月供占年收入比例，相当于月度 DTI 的 1/12）、月均可用净现金流代理（`FREE_INCOME_PROXY`，月均收入减去当期月供）、家庭人均年收入及抚养子女摊薄人均年收入（`INCOME_PER_CHILD`），通过相对比率降低绝对收入和地区物价差异的影响；
-   - **维度 2: 贷款条件与抵押覆盖变量（5 个）**：还款费率（`ANNUITY_TO_CREDIT_RATIO`）、预估还款期数（`ESTIMATED_TENURE`）、商品价值与信贷额度比（`GOODS_TO_CREDIT_RATIO`，抵押覆盖率代理）、首付与超融差额代理（`DOWN_PAYMENT_PROXY`，正值反映自筹首付沉没成本，负值反映手续费与保险加融的超额授信敞口，差额越负违约率越高）及单期月供与商品价值比（`ANNUITY_TO_GOODS_RATIO`）；
-   - **维度 3: 外部征信评分多维交互变量（9 个）**：基于三大外部评分（`EXT_SOURCE_1/2/3`）构建均值、极小值、极大值、标准差、联合乘积、动态归一化的经验加权评分（`EXT_SOURCE_WEIGHTED`，按 IV 2:3:5 权重折算）、缺失项数，以及评分与信贷收入比、年龄的交叉特征；
-   - **维度 4: 时间稳定性与生命周期交叉变量（8 个）**：将原始负数天数转为生命周期相对比例，避免年龄自然增长带来的伪相关。包括工龄占年龄比（`EMPLOYED_TO_BIRTH_RATIO`）、车龄占年龄比（`CAR_TO_BIRTH_RATIO`）、身份证持有稳定度、户籍定居稳定度、通信方式稳定度（`PHONE_TO_BIRTH_RATIO`）、换手机天数相对工龄匹配度（`PHONE_TO_EMPLOYED_RATIO`）、入职起始估计年龄（`AGE_AT_EMPLOYMENT`）及户籍与身份证变更时间比；
-   - **维度 5: 缺失模式与资产完备度变量（3 个）**：记录缺失模式：包括房屋信息集中缺失率（`HOUSE_INFO_MISSING_RATE`，反映无房产资产情况）、无私家车标记（`FLAG_OWN_CAR_MISSING`），以及仅统计原始字段的缺失总数（`TOTAL_NAN_COUNT`，反映填报配合度，避免将衍生列的空值重复计入）；
-   - **维度 6: 身份真实性、反欺诈与社交圈风险变量（4 个）**：提交证明材料总数量（`DOCUMENTS_PROVIDED_CNT`，衡量造假成本）、户籍/工作/居住地多重错配均值（`ADDRESS_MISMATCH_MEAN`，度量跨地域异常或异地包装嫌疑），以及逾期 30/60 DPD 社交圈违约人员传染占比（`DEF_OBS_RATIO_30/60`）；
-   - **维度 7: 征信查询趋势与多头借贷激增变量（3 个）**：央行征信局历史查询总次数汇总（`BUREAU_REQ_TOTAL`，`min_count=1` 保留未查征信的空值语义）、央行征信记录标记（`FLAG_BUREAU_REQ`），以及近 1 个月查询量相对远期（3~12 个月前）的短期借贷激增比（`BUREAU_REQ_SHORT_TO_LONG`），捕捉短时间内集中借贷的资金压力；
-   - **维度 8: 行业与职业分组基准统计量（4 个，严格零穿越设计）**：仅在训练集上按职业和行业聚合计算收入均值，再通过 `left join` 映射计算借款人在同业中的相对收入比率（`INCOME_TO_OCCUPATION_TYPE_RATIO`、`INCOME_TO_ORGANIZATION_TYPE_RATIO`），消除行业间基准差异；
-   - **全量特征宽表构建**：由 `03_feature_engineering.py` 统一生成并保存候选特征宽表（120 个原始特征 + 1 个异常标记 + 41 个业务衍生 = 162 个候选特征，宽表共 164 列含 ID 与 TARGET），供评分卡与 LightGBM 统一读取与分流适配。
-4. **传统统计评分卡（LR）与机器学习提升树（LightGBM）建模**：
-   - **传统统计评分卡（Logistic Regression）**：对接特征宽表，经数据质量粗筛、批量 IV 初筛（IV ≥ 0.02）、房屋同源去重、Spearman 贪心去共线（|r| ≥ 0.80）、`OptBinning` 约束分箱（单箱样本 ≥ 5%、坏样本 ≥ 30、数值单调与比率 U 型放宽）、方差膨胀因子（VIF ≤ 5）多重共线性处理、双向逐步回归（AIC 准则）以及逻辑回归系数负符号严格校验，按常用的 PDO 刻度（基准分 600 分，Odds 翻倍 PDO = 20）输出整数评分卡。
-   - **机器学习提升树（LightGBM）**：对接特征宽表，保留连续分布与缺失分支，结合分层 5 折交叉验证 OOF、累计增益（Gain Importance 前 95%）精选与 Optuna TPE 贝叶斯搜索浅树与强正则超参数，完成违约概率预测并输出评估指标。
+## 2. Experimental results and evaluation
 
----
+Models are evaluated on the isolated `Valid` split and the unlabeled `Test` set.
 
-## 2. 实验结果与评估指标
+### 2.1 Model performance comparison
 
-模型评估均在独立封存的验证集（Valid）与测试集（Test）上完成：
-
-### 2.1 模型综合性能指标对比
-
-| 模型架构                         | 数据集划分                  | 样本量     | 区分度 (ROC-AUC) | 鉴别力 (KS)   | 跨客群稳定性 (PSI) | 核心特性说明                   |
-|:---------------------------- |:---------------------- |:-------:|:-------------:|:----------:|:------------:|:------------------------ |
-| **LightGBM (5折CV + Optuna)** | 训练集 (Train 5-Fold OOF) | 246,008 | **0.7676**    | **0.3991** | 基准 (0.00000) | 5折交叉验证集成，具备非线性建模能力       |
-| **LightGBM (5折CV + Optuna)** | 验证集 (Valid)            | 61,503  | **0.7658**    | **0.3982** | —            | 独立验证集评估                  |
-| **LightGBM (5折CV + Optuna)** | 测试集 (Test)             | 48,744  | —             | —          | **0.00141**  | 跨客群表现稳定 (PSI < 0.10)     |
-| **标准信用评分卡 (OptBinning)**     | 训练集 (Train)            | 246,008 | 0.7523        | 0.3747     | 基准 (0.00000) | 单调WOE + VIF + 逐步回归，纯整数分值 |
-| **标准信用评分卡 (OptBinning)**     | 验证集 (Valid)            | 61,503  | 0.7466        | 0.3665     | —            | 独立验证集评估                  |
-| **标准信用评分卡 (OptBinning)**     | 测试集 (Test)             | 48,744  | —             | —          | **0.00131**  | 跨客群表现稳定 (PSI < 0.10)     |
+| Model architecture | Split | Samples | ROC-AUC | KS | Population stability (PSI) | Notes |
+|:--- |:--- |:---:|:---:|:---:|:---:|:--- |
+| **LightGBM (5-Fold CV + Optuna)** | Train (5-Fold OOF) | 246,008 | **0.7676** | **0.3991** | Baseline (0.00000) | 5-fold CV tree ensemble |
+| **LightGBM (5-Fold CV + Optuna)** | Valid | 61,503 | **0.7658** | **0.3982** | - | Held-out validation |
+| **LightGBM (5-Fold CV + Optuna)** | Test | 48,744 | - | - | **0.00141** | Stable on test set (PSI < 0.10) |
+| **Standard Scorecard (OptBinning)** | Train | 246,008 | 0.7510 | 0.3733 | Baseline (0.00000) | Monotonic WOE + VIF + stepwise LR, integer points |
+| **Standard Scorecard (OptBinning)** | Valid | 61,503 | 0.7456 | 0.3655 | - | Held-out validation |
+| **Standard Scorecard (OptBinning)** | Test | 48,744 | - | - | **0.00133** | Stable on test set (PSI < 0.10) |
 
 > [!NOTE]
-> **群体稳定性指标（PSI）与高对抗 AUC 对比**：通常以 PSI < 0.10 作为客群分布基本稳定的参考阈值。评分卡总分与 LightGBM 预测概率在测试集上的 PSI 分别为 0.00131 和 0.00141，分布极其稳定。值得强调的是，尽管对抗验证表明训练集与测试集特征存在显著漂移（对抗 AUC 高达 0.89），但最终模型预测输出仍保持了极佳的跨客群稳定性（高对抗 AUC 与极低模型 PSI 形成鲜明对比）。
+> A PSI below `0.10` is standard practice for distribution stability in credit risk monitoring. Even though adversarial validation found substantial feature drift between `Train` and `Test` (`AUC = 0.89`), both the Scorecard total score (`PSI = 0.00133`) and LightGBM predicted probabilities (`PSI = 0.00141`) stay stable on `Test`.
 
-### 2.2 样本分层审计账本 (`split_audit.csv`)
+### 2.2 Stratified split audit (`split_audit.csv`)
 
-| 数据集               | 样本量     | 样本占比    | 正常客户 (0) | 违约客户 (1) | 坏账率 (Bad Rate) |
-|:----------------- |:-------:|:-------:|:--------:|:--------:|:--------------:|
-| 原始训练集 (Raw Train) | 307,511 | 100.00% | 282,686  | 24,825   | 8.0729%        |
-| **训练集 (Train)**   | 246,008 | 80.00%  | 226,148  | 19,860   | 8.0729%        |
-| **验证集 (Valid)**   | 61,503  | 20.00%  | 56,538   | 4,965    | 8.0728%        |
+| Dataset | Samples | Share | Non-Default (0) | Default (1) | Bad Rate |
+|:--- |:---:|:---:|:---:|:---:|:---:|
+| Raw Train | 307,511 | 100.00% | 282,686 | 24,825 | 8.0729% |
+| **Train** | 246,008 | 80.00% | 226,148 | 19,860 | 8.0729% |
+| **Valid** | 61,503 | 20.00% | 56,538 | 4,965 | 8.0728% |
 
----
+## 3. Pipeline architecture
 
-## 3. 流水线执行架构
-
-代码位于 `baseline/` 目录，按数字编号顺序执行：
+Run the scripts in `baseline/` in numerical order:
 
 ```mermaid
 flowchart TD
-    Raw["原始数据: data/raw/application_train.csv"] --> Split["00_stratified_split.py<br/>(8:2 分层切分与物理隔离)"]
-    Split --> Train["训练集: Train (80%)<br/>(仅用于拟合规则与参数学习)"]
-    Split --> Valid["验证集: Valid (20%)<br/>(独立封存，不参与任何规则 fit)"]
+    Raw["Raw Data: data/raw/application_train.csv"] --> Split["00_stratified_split.py<br/>(80/20 Stratified Split & Isolation)"]
+    Split --> Train["Train Set (80%)<br/>(Fit rules & parameters only)"]
+    Split --> Valid["Valid Set (20%)<br/>(Held-out, never used in fitting)"]
 
-    Train --> EDA["01_eda.py<br/>(特征体检账本)"]
-    Train --> AdvVal["02_adversarial_validation.py<br/>(LightGBM 探测跨期分布差异)"]
+    Train --> EDA["01_eda.py<br/>(Feature Profiling Ledger)"]
+    Train --> AdvVal["02_adversarial_validation.py<br/>(LightGBM Covariate Shift Probe)"]
 
-    EDA --> FE["03_feature_engineering.py (统一特征工程)<br/>• 异常值修复与退休客群标记<br/>• 覆盖 8 大风控维度业务衍生 (41 个衍生 + 1 个标记)<br/>• 行业/职业分组基准均值与相对水平比率 (严格仅在训练集计算)<br/>• 输出全量特征宽表: train/valid/test_features_full"]
+    EDA --> FE["03_feature_engineering.py (Unified Feature Engineering)<br/>• Anomaly fixing & retiree flag<br/>• 8 risk dimensions (41 business derived + 1 flag)<br/>• Occupation/industry income benchmarks (fit on Train only)<br/>• Outputs: train/valid/test_features_full"]
     AdvVal --> FE
-    Valid -.->|"仅做 transform 映射<br/>(不参与拟合)"| FE
+    Valid -.->|"Transform/merge only<br/>(zero leakage)"| FE
 
-    FE --> Scorecard["04_scorecard_modeling.py<br/>(传统统计评分卡：LR)<br/>• 数据质量与 IV ≥ 0.02 漏斗粗筛<br/>• 房屋同源去重与相关性贪心过滤<br/>• OptBinning 约束分箱 & WOE 编码<br/>• VIF ≤ 5 多重共线性消除<br/>• 逐步回归 (AIC) & 系数负符号校验<br/>• PDO=20, 600 基准分刻度映射"]
-    FE --> LGB["05_lightgbm_modeling.py<br/>(机器学习提升树：LightGBM)<br/>• 原生 category 类别特征适配<br/>• 剔除同值率 > 95% 特征<br/>• Spearman 宽阈值去共线 (|r| ≥ 0.95)<br/>• 5折 CV 累计分裂增益精选 (Top 95%)<br/>• Optuna TPE 贝叶斯搜索浅树与强正则<br/>• 5折模型集成推理"]
+    FE --> Scorecard["04_scorecard_modeling.py<br/>(Standard LR Scorecard)<br/>• Quality & IV >= 0.02 funnel<br/>• Housing dedup & Spearman filter (|r| > 0.80)<br/>• OptBinning constraints & empirical WOE<br/>• WOE corr filter & VIF <= 5<br/>• Stepwise (AIC) & negative coef check<br/>• PDO=20, Base=600 point scaling"]
+    FE --> LGB["05_lightgbm_modeling.py<br/>(LightGBM Modeling)<br/>• Native category dtype alignment<br/>• Drop >95% primary value features<br/>• Spearman filter (|r| >= 0.95)<br/>• 5-Fold CV Gain selection (Top 95%)<br/>• Optuna TPE shallow-tree tuning<br/>• 5-Fold ensemble inference"]
 
-    Scorecard --> Eval["统一特征映射与模型验证"]
+    Scorecard --> Eval["Unified Validation & Stability Check"]
     LGB --> Eval
 
-    Eval --> MetricValid["验证集 AUC / KS 独立评估"]
-    Eval --> MetricTest["测试集总分 / 概率 PSI 跨客群稳定性"]
+    Eval --> MetricValid["Valid Set AUC / KS"]
+    Eval --> MetricTest["Test Set Score / Prob PSI"]
 ```
 
 <details>
-<summary>点击展开 ASCII 字符版架构图</summary>
+<summary>Expand ASCII architecture diagram</summary>
 
 ```text
-                    [ 原始数据: data/raw/application_train.csv ]
+                    [ Raw Data: data/raw/application_train.csv ]
                                        │
                 ┌──────────────────────┴──────────────────────┐
-                │ 00_stratified_split.py (8:2 分层切分与物理隔离) │
+                │ 00_stratified_split.py (80/20 Isolation)    │
                 └──────────────────────┬──────────────────────┘
                                        │
             ┌──────────────────────────┴──────────────────────────┐
             ▼                                                     ▼
-    [ 训练集: Train (80%) ]                               [ 验证集: Valid (20%) ]
-    (仅用于拟合规则与参数学习)                               (独立封存，不参与任何规则 fit)
+       [ Train (80%) ]                                      [ Valid (20%) ]
+       (Fit rules only)                                     (Held-out eval only)
             │                                                     │
    ┌────────┴────────┐                                            │
    ▼                 ▼                                            │
 01_eda.py    02_adversarial_validation.py                         │
-(特征体检账本)  (LightGBM 探测跨期分布差异)                            │
+(EDA Ledger) (Covariate Shift Probe)                              │
    │                 │                                            │
    └────────┬────────┘                                            │
             ▼                                                     │
-03_feature_engineering.py (统一特征工程) ◄────────────────────────┘
-- 异常值修复与退休客群标记
-- 覆盖 8 大风控维度业务衍生 (41 个业务衍生 + 1 个状态标记)
-- 行业/职业分组基准均值与相对水平比率 (严格仅在训练集计算)
-- 输出全量特征宽表: train_features_full, valid_features_full, test_features_full
+03_feature_engineering.py (Unified Feature Engineering) ◄─────────┘
+- Anomaly fixing & retiree flag
+- 8 risk dimensions (41 business derived + 1 flag)
+- Occupation/industry income benchmarks (fit on Train only)
+- Outputs: train_features_full, valid_features_full, test_features_full
             │
             ├─────────────────────────────────┐
             ▼                                 ▼
 04_scorecard_modeling.py             05_lightgbm_modeling.py
-(传统统计评分卡：LR)                 (机器学习提升树：LightGBM)
-- 数据质量与 IV >= 0.02 漏斗粗筛      - 原生 category 类别特征适配
-- 房屋同源去重与相关性贪心过滤         - 剔除同值率 > 95% 特征
-- OptBinning 约束分箱 & WOE 编码     - Spearman 宽阈值去共线 (|r| >= 0.95)
-- VIF <= 5 多重共线性消除             - 5折 CV 累计分裂增益精选 (Top 95%)
-- 逐步回归 (AIC) & 系数负符号校验     - Optuna TPE 贝叶斯搜索浅树与强正则
-- PDO=20, 600 基准分刻度映射          - 5折模型集成推理
+(Standard LR Scorecard)              (LightGBM Modeling)
+- Quality & IV >= 0.02 screen        - Native category alignment
+- Housing dedup & |r| > 0.80 filter  - Drop >95% primary value features
+- OptBinning & empirical WOE         - Spearman filter (|r| >= 0.95)
+- WOE corr & VIF <= 5                - 5-Fold CV Gain selection (Top 95%)
+- Stepwise (AIC) & coef sign check   - Optuna TPE tuning
+- PDO=20, Base=600 scaling           - 5-Fold ensemble inference
             │                                 │
             └────────────────┬────────────────┘
                              ▼
-                    [ 统一特征映射与模型验证 ]
+                  [ Unified Evaluation ]
                              │
             ┌────────────────┴────────────────┐
             ▼                                 ▼
- [ 验证集 AUC / KS 独立评估 ]       [ 测试集总分 / 概率 PSI 跨客群稳定性 ]
+     [ Valid AUC / KS ]               [ Test Set PSI ]
 ```
 
 </details>
 
----
+## 4. Script breakdown
 
-## 4. 核心脚本解析
+- **`baseline/00_stratified_split.py`**:
+  Splits the 307,511 raw training records 80/20 by `TARGET` (`random_state=123`). Checks primary key uniqueness, zero ID overlap, and bad-rate difference (< 0.01%), then saves `split_audit.csv`.
+- **`baseline/01_eda.py`**:
+  Profiles all 120 raw business columns on `Train` (missing rates, primary value ratios, quantiles, and optimal-binning IV with `max_n_prebins=30`, `min_prebin_size=0.02`, `cat_cutoff=0.01`, `special_codes=[365243, 'XNA']`), verifies co-missing housing groups and `DAYS_EMPLOYED=365243`, and writes `raw_features_summary.csv`.
+- **`baseline/02_adversarial_validation.py`**:
+  Trains a 5-fold shallow LightGBM (`max_depth=5`, `num_leaves=16`, `min_child_samples=50`) to predict `is_test`, getting `AUC = 0.89`. The output is used only to measure train/test distribution shift, not to filter features.
+- **`baseline/03_feature_engineering.py`**:
+  Cleans anomalies (`FLAG_DAYS_EMPLOYED_ANOMALOUS`, `'XNA'` gender, social circle `> 30`), builds 41 domain features across 8 dimensions (42 new columns in total), computes occupation and organization mean incomes on `Train` only before left-joining to `Valid` and `Test`, and saves `data/processed/*_features_full.csv` (162 candidate features) along with `full_features_summary.csv`.
+- **`baseline/04_scorecard_modeling.py`**:
+  Loads the unified feature tables, maps `NAME_EDUCATION_TYPE` ordinally, filters data quality and `IV >= 0.02`, deduplicates housing features, applies greedy Spearman filtering (`|r| > 0.80`), fits constrained `OptBinning` (`max_n_prebins=30`, `min_prebin_size=0.02`, `min_bin_size=0.05`, `min_bin_n_event=30`, `cat_cutoff=0.01`, `special_codes=['XNA']`, empirical WOE for special and missing bins, monotonic and U-shape constraints), removes WOE-space collinearity (`0.80 <= |r| < 1.0`) and `VIF <= 5.0`, runs bidirectional AIC stepwise selection, drops 5 sign-inverted features to enforce consistent risk direction, and fits an unpenalized LR scorecard (`PDO = 20`, `Base = 600`) with 26 final features, writing `final_scorecard_table.csv` and `scorecard_eval_summary.csv`.
+- **`baseline/05_lightgbm_modeling.py`**:
+  Loads the unified feature tables, aligns native `category` dtypes, drops features with `primary_value_ratio > 0.95` and `|r| >= 0.95`, keeps the 53 features covering the top 95% of cumulative 5-fold CV split gain, runs 30 Optuna TPE trials for tree depth, leaves, and L1/L2 regularization, and evaluates the 5-fold ensemble (`lgb_eval_summary.csv`, `lgb_feature_importance.csv`).
 
-- **`baseline/00_stratified_split.py`**：
-  按标签分层抽样（`random_state=123`），将 30.7 万条原始训练数据划分为 80% 训练集与 20% 验证集。校验主键唯一性、样本交集（为 0）与坏账率偏差（< 0.01%），输出审计文件 `split_audit.csv`。
-- **`baseline/01_eda.py`**：
-  分析训练集 120 余个字段的统计量、缺失率、主要值占比、单变量分箱、IV、JS 散度与 Gini 系数；处理房屋信息集中缺失与 `DAYS_EMPLOYED=365243` 异常值，输出原始特征画像表 `raw_features_summary.csv`。
-- **`baseline/02_adversarial_validation.py`**：
-  以“是否属于测试集”（`is_test`）为标签训练 LightGBM，通过浅树与限制叶节点样本量（`max_depth=5, num_leaves=16, min_child_samples=50`）检验两组样本的宏观分布差异（AUC 为 0.89）。该结果仅用于证实宏观分布漂移以对照后续模型极低 PSI，不参考具体变量漂移情况进行特征筛选，严格避免数据泄露。
-- **`baseline/03_feature_engineering.py`（统一特征工程）**：
-  处理异常值与退休客群标记（`FLAG_DAYS_EMPLOYED_ANOMALOUS`）；构造覆盖 8 大风控维度的 41 个业务衍生特征（共计 42 个新增衍生特征）；仅在训练集上聚合计算同行业与同职业的收入均值基准，并分别以无监督映射形式（`left join`）合并至验证集与测试集；生成并保存全量特征宽表（162 个候选特征，总宽表 164 列含 ID 与 TARGET）至 `data/processed/*_features_full.csv`，输出数据字典账本 `full_features_summary.csv`。
-- **`baseline/04_scorecard_modeling.py`（标准信用评分卡）**：
-  读取全量特征宽表。执行学历有序单调映射，通过数据质量粗筛、批量 IV 初筛（IV ≥ 0.02）、房屋同源去重与全局 Spearman 秩相关贪心过滤；拟合 `OptBinning` 精细约束分箱（单箱 ≥ 5%、坏样本 ≥ 30、数值单调与比率 U 型放宽）；通过迭代 VIF 诊断（VIF ≤ 5.0）消除多重共线性，运行双向逐步回归（AIC 准则）并严格校验逻辑回归系数符号（剔除 6 个符号反转变量）；设定 PDO = 20、基准分 600 分，导出各分箱得分明细表 `final_scorecard_table.csv`（最终入模 25 个特征）并评估验证集指标与测试集 PSI。
-- **`baseline/05_lightgbm_modeling.py`（LightGBM 集成建模）**：
-  读取全量特征宽表。统一对齐类别变量原生 `category` 格式；剔除同值率 > 95% 字段与极端共线（|r| ≥ 0.95）字段；运行 5 折交叉验证基准模型，按累计分裂增益（Gain Importance 前 95%）精选核心特征（入模 53 个特征）；使用 Optuna 运行 30 次 TPE 贝叶斯搜索优化浅树深度、叶子数与 L1/L2 正则化超参数；完成 5 折模型集成并评估验证集和测试集。
+## 5. Main risk drivers
 
----
+Across Scorecard IV and LightGBM split gain, the strongest risk predictors fall into four groups:
 
-## 5. 核心特征分析
+1. External credit scores: `EXT_SOURCE_MEAN`, `EXT_SOURCE_MIN`, `EXT_SOURCE_3`, and `EXT_SOURCE_2`. Each has univariate IV above 0.32, and together they account for nearly half of the split gain in LightGBM.
+2. Leverage and repayment capacity: `GOODS_TO_CREDIT_RATIO` (collateral coverage vs. over-financing), `AMT_ANNUITY`, and `ANNUITY_TO_CREDIT_RATIO` (effective payment rate and inverse tenure).
+3. Applicant stability and profile: `DAYS_BIRTH`, `DAYS_EMPLOYED`, `EMPLOYED_TO_BIRTH_RATIO`, and `ORGANIZATION_TYPE` / `OCCUPATION_TYPE`.
+4. Behavioral and inquiry signals: `DAYS_LAST_PHONE_CHANGE`, `TOTAL_NAN_COUNT` (application completeness), and `BUREAU_REQ_SHORT_TO_LONG` (short-term borrowing surge).
 
-结合评分卡 IV 与 LightGBM 增益重要性（Gain Importance），违约区分度较高的特征主要集中在以下维度：
-
-1. **外部征信评分**：
-   `EXT_SOURCE_MEAN`、`EXT_SOURCE_MIN`、`EXT_SOURCE_3`、`EXT_SOURCE_2`。单变量 IV 均在 0.33 以上，在 LightGBM 中合计贡献了近 50% 的分裂增益。其中均值有助于平滑单家机构波动，最小值反映短板维度的信用记录。
-2. **负债杠杆与偿付能力**：
-   `GOODS_TO_CREDIT_RATIO`（商品价值与贷款额度比，反映抵押覆盖与超融情况）、`AMT_ANNUITY`（单期月供金额）、`ANNUITY_TO_CREDIT_RATIO`（月供与贷款额度比，反映还款期数与费率倒数）。
-3. **稳定性与基本信息**：
-   `DAYS_BIRTH`（年龄）、`DAYS_EMPLOYED`（工龄）、`EMPLOYED_TO_BIRTH_RATIO`（工龄占年龄比例，反映就业稳定程度）、`ORGANIZATION_TYPE` / `OCCUPATION_TYPE`（单位类型与职业）。
-4. **行为变化与征信频次**：
-   `DAYS_LAST_PHONE_CHANGE`（更换手机天数）、`TOTAL_NAN_COUNT`（原始信息缺失总项数，反映填报完整度）、`BUREAU_REQ_SHORT_TO_LONG`（短期与中长期征信查询次数比）。
-
----
-
-## 6. 项目文件组织结构
+## 6. Project structure
 
 ```
 home-credit-default-risk/
-├── baseline/                               # 核心流水线脚本
-│   ├── 00_stratified_split.py              # 1. 样本 8:2 分层抽样与物理隔离
-│   ├── 01_eda.py                           # 2. 探索性数据分析与特征体检表构建
-│   ├── 02_adversarial_validation.py        # 3. LightGBM 对抗性验证 (检验分布差异)
-│   ├── 03_feature_engineering.py           # 4. 统一风控特征工程与全量特征宽表构建
-│   ├── 04_scorecard_modeling.py            # 5. 标准信用评分卡建模 (IV/分箱/VIF/逐步回归/PDO)
-│   └── 05_lightgbm_modeling.py             # 6. LightGBM 建模 (Gain精选/Optuna调优/测试推理)
+├── baseline/                               # Modular modeling pipeline scripts
+│   ├── 00_stratified_split.py              # 1. 80/20 stratified split & isolation
+│   ├── 01_eda.py                           # 2. EDA & raw feature profiling
+│   ├── 02_adversarial_validation.py        # 3. LightGBM adversarial validation
+│   ├── 03_feature_engineering.py           # 4. Unified 8-dimension feature engineering
+│   ├── 04_scorecard_modeling.py            # 5. Standard scorecard (IV/Binning/VIF/AIC/PDO)
+│   └── 05_lightgbm_modeling.py             # 6. LightGBM (Gain selection/Optuna/5-fold CV)
 │
-├── data/                                   # 数据目录 (.gitignore 已忽略大文件)
-│   ├── raw/                                # 原始数据集
-│   │   ├── application_train.csv           # 原始训练集 (带标签, 30.7万条)
-│   │   ├── application_test.csv            # 测试集 (未标注, 4.8万条)
-│   │   └── HomeCredit_columns_description.csv # 字段描述说明表
-│   ├── interim/                            # 物理隔离切分后的中间数据
-│   │   ├── application_train_split.csv     # 训练集 (80%, 24.6万条)
-│   │   └── application_valid.csv           # 验证集 (20%, 6.1万条)
-│   └── processed/                          # 统一特征工程特征宽表
-│       ├── train_features_full.csv         # 训练集全量特征宽表 (164 列)
-│       ├── valid_features_full.csv         # 验证集全量特征宽表 (164 列)
-│       └── test_features_full.csv          # 测试集全量特征宽表 (163 列)
+├── data/                                   # Data directory (large files gitignored)
+│   ├── raw/                                # Raw Kaggle CSVs
+│   │   ├── application_train.csv           # Raw train set (307,511 rows)
+│   │   ├── application_test.csv            # Test set (48,744 rows)
+│   │   └── HomeCredit_columns_description.csv # Column description dictionary
+│   ├── interim/                            # Isolated split files
+│   │   ├── application_train_split.csv     # Train split (80%, 246,008 rows)
+│   │   └── application_valid.csv           # Valid split (20%, 61,503 rows)
+│   └── processed/                          # Unified feature engineering tables
+│       ├── train_features_full.csv         # Train wide table (164 cols)
+│       ├── valid_features_full.csv         # Valid wide table (164 cols)
+│       └── test_features_full.csv          # Test wide table (163 cols)
 │
-├── outputs/                                # 实验输出、模型评估与审计报告
-│   ├── validation/                         # 数据切分与验证检验
-│   │   ├── split_audit.csv                 # 训练集与验证集分层切分审计报告
-│   │   └── adversarial_validation_feature_importance.csv # 对抗验证特征重要性表
-│   ├── eda/                                # 探索性分析全量字段体检账本
-│   │   ├── raw_features_summary.csv        # 原始 120+ 字段 IV/缺失/分箱详细报告
-│   │   └── full_features_summary.csv       # 全量候选特征字典与质量体检账本
-│   └── models/                             # 模型文件与评估汇总
-│       ├── final_scorecard_table.csv       # 标准评分卡各分箱得分明细表 (含PDO加减分)
-│       ├── scorecard_eval_summary.csv      # 评分卡 AUC、KS 与测试集 PSI 汇总表
-│       ├── lgb_feature_importance.csv      # LightGBM 增益特征重要性与累计 Gain 表
-│       └── lgb_eval_summary.csv            # LightGBM 5折 OOF、验证集与测试集评估汇总
+├── outputs/                                # Evaluation summaries & audit reports
+│   ├── validation/                         # Split audit & adversarial validation
+│   │   ├── split_audit.csv                 # Train/Valid stratified split audit
+│   │   └── adversarial_validation_feature_importance.csv
+│   ├── eda/                                # Feature dictionaries & profiling
+│   │   ├── raw_features_summary.csv        # Raw 120-feature IV/missingness report
+│   │   └── full_features_summary.csv       # Full 162-feature quality ledger
+│   └── models/                             # Model tables & metrics
+│       ├── final_scorecard_table.csv       # Detailed scorecard binning & PDO points
+│       ├── scorecard_eval_summary.csv      # Scorecard AUC, KS & Test PSI
+│       ├── lgb_feature_importance.csv      # LightGBM gain & cumulative importance
+│       └── lgb_eval_summary.csv            # LightGBM OOF, Valid & Test PSI summary
 │
-├── pyproject.toml                          # 项目依赖与配置 (uv 规范)
-├── uv.lock                                 # 依赖版本锁定文件
-├── .python-version                         # Python 解释器版本 (3.12)
-├── LICENSE                                 # 开源协议文件 (MIT)
-├── .gitignore                              # Git 忽略配置
-└── README.md                               # 项目说明文档
+├── pyproject.toml                          # Project dependencies (uv)
+├── uv.lock                                 # Dependency lockfile
+├── .python-version                         # Python version (3.12)
+├── LICENSE                                 # MIT License
+├── .gitignore                              # Git ignore rules
+├── README.md                               # Documentation (English)
+└── README_zh.md                            # Documentation (Simplified Chinese)
 ```
 
----
+## 7. Quick start
 
-## 7. 快速开始与运行指南
+### 7.1 Environment setup (`uv`)
 
-### 7.1 环境配置（基于 uv）
+This project uses [uv](https://github.com/astral-sh/uv) with Python 3.12. All dependencies are pinned in `pyproject.toml` and `uv.lock`.
 
-本项目使用 [uv](https://github.com/astral-sh/uv) 管理虚拟环境与依赖。Python 版本（3.12）及第三方库均已记录在 `pyproject.toml` 与 `uv.lock` 中。
+#### 1. Install `uv`
 
-#### 1. 安装 uv
-
-根据操作系统安装 `uv`（已安装可跳过）：
-
-- **Windows (PowerShell)**:
-  
+- Windows (PowerShell):
   ```powershell
   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
   ```
-
-- **macOS / Linux**:
-  
+- macOS / Linux:
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
-
-- **通过 pip 安装（备选）**:
-  
+- Via `pip` (alternative):
   ```bash
   pip install uv
   ```
 
-#### 2. 同步并安装依赖
-
-克隆仓库后，在项目根目录下执行 `uv sync`。`uv` 会自动读取 `.python-version` 创建 `.venv`，并安装锁定的全部依赖：
+#### 2. Clone and sync environment
 
 ```bash
-# 克隆代码仓库
 git clone https://github.com/gorgeous211/home-credit-default-risk.git
 cd home-credit-default-risk
 
-# 同步环境并安装依赖
 uv sync
 ```
 
 > [!TIP]
-> **环境与硬件加速提示**：
-> 
-> 1. **执行方式**：使用 `uv run python <script.py>` 会直接在项目虚拟环境中运行脚本，无需手动激活环境。
-> 2. **NVIDIA GPU (CUDA) 加速**：LightGBM 默认使用 CPU 多线程运算。如需使用 CUDA 加速，可根据本地 CUDA 环境安装支持 GPU 的 LightGBM 构建版本。
-> 3. **Windows 动态链接库说明**：如遇 OpenBLAS / LAPACK 动态库冲突，脚本会自动优先读取虚拟环境下的 `Library/bin` 路径。
+> 1. Run scripts directly with `uv run python <script.py>` without manually activating `.venv`.
+> 2. LightGBM uses multiple CPU threads by default; install a CUDA-enabled LightGBM build if you want GPU acceleration.
+> 3. On Windows, scripts prioritize the virtual environment's `Library/bin` path to prevent OpenBLAS/LAPACK DLL conflicts.
 
----
+### 7.2 Data preparation
 
-### 7.2 数据准备
+1. Download the dataset from Kaggle: [Home Credit Default Risk Data](https://www.kaggle.com/competitions/home-credit-default-risk/data)
+2. Extract `application_train.csv`, `application_test.csv`, and `HomeCredit_columns_description.csv` into `data/raw/`.
 
-1. 从 Kaggle 下载赛题数据：[Home Credit Default Risk Data](https://www.kaggle.com/competitions/home-credit-default-risk/data)
-2. 解压后将 CSV 文件放置在 `data/raw/` 目录（包含 `application_train.csv`、`application_test.csv` 与 `HomeCredit_columns_description.csv`）。
+### 7.3 Run the pipeline
 
----
-
-### 7.3 流水线运行步骤
-
-各脚本解耦设计，建议按编号顺序依次执行：
+Run the scripts in numerical order:
 
 ```bash
-# 步骤 0: 样本分层切分与物理隔离 (生成 data/interim/* 与 split_audit.csv)
+# Step 0: Stratified split & physical isolation
 uv run python baseline/00_stratified_split.py
 
-# 步骤 1: 特征分析与指标报告生成 (输出 outputs/eda/raw_features_summary.csv)
+# Step 1: Exploratory data analysis & raw feature summary
 uv run python baseline/01_eda.py
 
-# 步骤 2: 对抗性验证检验分布差异 (输出 adversarial_validation_feature_importance.csv)
+# Step 2: Adversarial validation (Train vs. Test)
 uv run python baseline/02_adversarial_validation.py
 
-# 步骤 3: 全量风控特征工程与特征宽表构建 (生成 data/processed/* 与 outputs/eda/full_features_summary.csv)
+# Step 3: Unified feature engineering & wide table generation
 uv run python baseline/03_feature_engineering.py
 
-# 步骤 4: 拟合标准信用评分卡与 PDO 刻度计算 (输出 final_scorecard_table.csv 与评估指标)
+# Step 4: Standard credit scorecard modeling & PDO scaling
 uv run python baseline/04_scorecard_modeling.py
 
-# 步骤 5: 训练 LightGBM 模型与 Optuna 贝叶斯调参
+# Step 5: LightGBM modeling & Optuna tuning
 uv run python baseline/05_lightgbm_modeling.py
 ```
 
----
+## 8. Tools and references
 
-## 8. 相关工具与参考
-
-- **环境与依赖管理**：[uv](https://github.com/astral-sh/uv)
-- **赛题来源**：[Kaggle - Home Credit Default Risk](https://www.kaggle.com/competitions/home-credit-default-risk)
-- **评分卡工具**：[OptBinning: Optimal Binning for Credit Risk](https://github.com/guillermo-navas-palencia/optbinning)
-- **特征工程工具**：[Toad: Industrial Credit Risk Scorecard Development](https://github.com/amphibian-dev/toad)
-- **梯度提升决策树**：[LightGBM](https://github.com/microsoft/LightGBM)
-- **超参数优化框架**：[Optuna](https://optuna.org/)
+- [uv](https://github.com/astral-sh/uv): Environment and dependency management
+- [Kaggle - Home Credit Default Risk](https://www.kaggle.com/competitions/home-credit-default-risk): Competition dataset
+- [OptBinning](https://github.com/guillermo-navas-palencia/optbinning): Optimal binning and scorecard scaling
+- [Toad](https://github.com/amphibian-dev/toad): Stepwise selection and PSI calculation
+- [LightGBM](https://github.com/microsoft/LightGBM): Gradient boosting framework
+- [Optuna](https://optuna.org/): Hyperparameter optimization
